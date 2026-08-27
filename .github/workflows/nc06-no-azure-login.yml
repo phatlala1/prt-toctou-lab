@@ -1,0 +1,347 @@
+name: NC-06 no azure login (negative control)
+
+# Reproduces the trust-boundary shape of
+# Azure/terraform-cdk-constructs/.github/workflows/build.yml:
+#   pull_request_target -> environment: Build -> checkout head.repo + head.ref
+#   -> id-token: write -> azure/login@v2 -> yarn install --check-files
+#
+# Evidence provenance is deliberately split into two classes:
+#   workflowAuthored  - produced by base-repository-controlled steps only.
+#   prSelfReported    - produced by pull-request-controlled code. Never trusted
+#                       as proof on its own; used only as an execution marker.
+#
+# Deliberately NO `concurrency:` block. build.yml has none either, so the
+# original run R1 is not superseded when a later push creates R2.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  approval-binding-test:
+    name: Approval binding test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Build
+    env:
+      EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      EVENT_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      EVENT_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+      EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+      EVENT_RUN_ID: ${{ github.run_id }}
+      EVENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+      EVENT_NAME: ${{ github.event_name }}
+      BASE_REPOSITORY: ${{ github.repository }}
+      ENABLE_OWNED_AZURE_LOGIN: ${{ vars.ENABLE_OWNED_AZURE_LOGIN }}
+      # Negative control NC-02: set repository variable CHECKOUT_MODE=immutable
+      # to check out github.event.pull_request.head.sha instead of head.ref.
+      CHECKOUT_MODE: ${{ vars.CHECKOUT_MODE }}
+      EVIDENCE_DIR: ${{ github.workspace }}/evidence
+
+    steps:
+      # ---------------------------------------------------------------- #
+      # WORKFLOW-AUTHORED: immutable event snapshot, before any PR code.  #
+      # ---------------------------------------------------------------- #
+      - name: Record immutable event snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          snapshot_dir="$RUNNER_TEMP/msrc-toctou-evidence"
+          mkdir -p "$snapshot_dir"
+          /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          out = Path(os.environ["RUNNER_TEMP"]) / "msrc-toctou-evidence" / "event-snapshot.json"
+          out.write_text(json.dumps({
+              "schema": "msrc-pr-target-toctou/event-snapshot/v2",
+              "provenance": "workflowAuthored",
+              "recordedAtUtc": datetime.now(timezone.utc).isoformat(),
+              "eventHeadSha": os.environ.get("EVENT_HEAD_SHA", ""),
+              "eventHeadRef": os.environ.get("EVENT_HEAD_REF", ""),
+              "eventHeadRepository": os.environ.get("EVENT_HEAD_REPOSITORY", ""),
+              "pullRequestNumber": os.environ.get("EVENT_PR_NUMBER", ""),
+              "runId": os.environ.get("EVENT_RUN_ID", ""),
+              "runAttempt": os.environ.get("EVENT_RUN_ATTEMPT", ""),
+              "eventName": os.environ.get("EVENT_NAME", ""),
+              "baseRepository": os.environ.get("BASE_REPOSITORY", ""),
+              "checkoutMode": os.environ.get("CHECKOUT_MODE", "") or "mutable-ref",
+              "ownedAzureLoginEnabled": os.environ.get("ENABLE_OWNED_AZURE_LOGIN", "") == "true",
+          }, indent=2, sort_keys=True) + "\n")
+          PY
+
+      # ---------------------------------------------------------------- #
+      # The vulnerable primitive: resolve the fork's MUTABLE branch name  #
+      # at execution time, i.e. after the environment approval.           #
+      # ---------------------------------------------------------------- #
+      - name: Checkout mutable pull-request branch
+        if: env.CHECKOUT_MODE != 'immutable'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # NC-02 control: immutable SHA checkout.
+      - name: Checkout immutable pull-request head SHA (negative control NC-02)
+        if: env.CHECKOUT_MODE == 'immutable'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # ---------------------------------------------------------------- #
+      # WORKFLOW-AUTHORED: characterise the checked-out tree BEFORE any   #
+      # pull-request-controlled code is allowed to run. This is the trust #
+      # anchor that proves which revision executed, independently of any  #
+      # marker the pull request itself writes.                            #
+      # ---------------------------------------------------------------- #
+      - name: Record checked-out revision (pre-execution)
+        shell: bash
+        run: |
+          set -euo pipefail
+          snapshot_dir="$RUNNER_TEMP/msrc-toctou-evidence"
+          checked_out_sha="$(/usr/bin/git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+          printf '%s\n' "$checked_out_sha" > "$snapshot_dir/checked-out-sha.txt"
+          echo "CHECKED_OUT_SHA=$checked_out_sha" >> "$GITHUB_ENV"
+          if [[ "$EVENT_HEAD_SHA" == "$checked_out_sha" ]]; then
+            echo "SHA_MISMATCH=false" >> "$GITHUB_ENV"
+          else
+            echo "SHA_MISMATCH=true" >> "$GITHUB_ENV"
+          fi
+          CHECKED_OUT_SHA="$checked_out_sha" /usr/bin/python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          out = Path(os.environ["RUNNER_TEMP"]) / "msrc-toctou-evidence" / "pre-execution-tree.json"
+
+          pkg = workspace / "package.json"
+          pkg_bytes = pkg.read_bytes() if pkg.exists() else b""
+          try:
+              scripts = json.loads(pkg_bytes or b"{}").get("scripts") or {}
+          except ValueError:
+              scripts = {}
+
+          subject = subprocess.run(
+              ["/usr/bin/git", "-C", str(workspace), "log", "-1", "--format=%s%n%cI"],
+              capture_output=True, text=True, check=False,
+          ).stdout.strip().splitlines()
+
+          out.write_text(json.dumps({
+              "schema": "msrc-pr-target-toctou/pre-execution-tree/v1",
+              "provenance": "workflowAuthored",
+              "recordedAtUtc": datetime.now(timezone.utc).isoformat(),
+              "checkedOutSha": os.environ["CHECKED_OUT_SHA"],
+              "headCommitSubject": subject[0] if subject else None,
+              "headCommitDateUtc": subject[1] if len(subject) > 1 else None,
+              "packageJsonPresent": pkg.exists(),
+              "packageJsonSha256": hashlib.sha256(pkg_bytes).hexdigest() if pkg_bytes else None,
+              "declaredLifecycleScripts": sorted(
+                  k for k in scripts
+                  if k in ("preinstall", "install", "postinstall", "prepare", "prepublish")
+              ),
+              "preinstallDeclared": "preinstall" in scripts,
+          }, indent=2, sort_keys=True) + "\n")
+          PY
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.16.0
+
+      # ---------------------------------------------------------------- #
+      # Protected credential boundary is released here, BEFORE untrusted  #
+      # package lifecycle scripts run. Same ordering as build.yml.        #
+      # Negative control NC-05: unset vars.ENABLE_OWNED_AZURE_LOGIN.      #
+      # ---------------------------------------------------------------- #
+      # NC-06: azure/login step intentionally REMOVED.
+
+      # ---------------------------------------------------------------- #
+      # PR-CONTROLLED EXECUTION. stdout is captured by the workflow so    #
+      # the marker line is recorded on a second, workflow-owned channel.  #
+      # ---------------------------------------------------------------- #
+      - name: Execute PR-controlled package lifecycle
+        id: lifecycle
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          yarn install --check-files 2>&1 | tee "$RUNNER_TEMP/msrc-toctou-evidence/yarn-install.log"
+
+      # ---------------------------------------------------------------- #
+      # WORKFLOW-AUTHORED: merge both evidence classes without conflating #
+      # them. Tolerant of any earlier step failing.                       #
+      # ---------------------------------------------------------------- #
+      - name: Produce sanitized final result
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          snapshot_dir="$RUNNER_TEMP/msrc-toctou-evidence"
+          mkdir -p "$EVIDENCE_DIR" "$snapshot_dir"
+          for f in event-snapshot.json checked-out-sha.txt pre-execution-tree.json yarn-install.log; do
+            if [[ -f "$snapshot_dir/$f" ]]; then cp "$snapshot_dir/$f" "$EVIDENCE_DIR/$f"; fi
+          done
+          LIFECYCLE_STEP_OUTCOME="${{ steps.lifecycle.outcome }}" /usr/bin/python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          evidence = Path(os.environ["EVIDENCE_DIR"])
+
+          def load(name):
+              path = evidence / name
+              if not path.exists():
+                  return None
+              try:
+                  return json.loads(path.read_text())
+              except ValueError:
+                  return None
+
+          event = load("event-snapshot.json") or {}
+          tree = load("pre-execution-tree.json") or {}
+          marker_path = evidence / "preinstall-marker.json"
+          marker_bytes = marker_path.read_bytes() if marker_path.exists() else b""
+          marker = load("preinstall-marker.json")
+
+          checked_path = evidence / "checked-out-sha.txt"
+          checked = checked_path.read_text().strip() if checked_path.exists() else ""
+          event_head = event.get("eventHeadSha") or ""
+
+          log_path = evidence / "yarn-install.log"
+          log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
+
+          workflow_authored = {
+              "eventHeadSha": event_head,
+              "checkedOutSha": checked,
+              "shaMismatch": bool(event_head and checked and event_head != checked),
+              "shaComparisonPossible": bool(event_head and checked),
+              "checkoutMode": event.get("checkoutMode"),
+              "preinstallDeclaredInCheckedOutTree": tree.get("preinstallDeclared"),
+              "checkedOutPackageJsonSha256": tree.get("packageJsonSha256"),
+              "headCommitSubject": tree.get("headCommitSubject"),
+              "lifecycleStepOutcome": os.environ.get("LIFECYCLE_STEP_OUTCOME"),
+              "markerLineObservedInLifecycleStdout": "SAFE_PREINSTALL_EXECUTED=true" in log_text,
+              "markerFilePresent": marker_path.exists(),
+              "markerFileSha256": hashlib.sha256(marker_bytes).hexdigest() if marker_bytes else None,
+              "ownedAzureLoginEnabled": event.get("ownedAzureLoginEnabled"),
+          }
+
+          pr_self_reported = {
+              "_warning": "Authored by pull-request-controlled code. Execution marker only; not independent proof.",
+              "markerValue": (marker or {}).get("marker"),
+              "githubOidcRequestCapabilityPresent": bool((marker or {}).get("githubOidc", {}).get("requestCapabilityPresent")),
+              "githubOidcTokenRequestSucceeded": bool((marker or {}).get("githubOidc", {}).get("tokenRequestSucceeded")),
+              "azureAccountAuthenticated": bool((marker or {}).get("azure", {}).get("accountShowSucceeded")),
+              "azureArmTokenAcquired": bool((marker or {}).get("azure", {}).get("armTokenAcquisitionSucceeded")),
+              "azureArmReadSucceeded": bool((marker or {}).get("azure", {}).get("armReadSucceeded")),
+          }
+
+          # Execution is asserted only from the two workflow-owned channels:
+          # the captured lifecycle stdout, and the workflow's own pre-execution
+          # observation that the checked-out tree declared a preinstall script.
+          preinstall_executed = bool(
+              workflow_authored["markerLineObservedInLifecycleStdout"]
+              and workflow_authored["preinstallDeclaredInCheckedOutTree"]
+          )
+
+          result = {
+              "schema": "msrc-pr-target-toctou/result/v2",
+              "producedAtUtc": datetime.now(timezone.utc).isoformat(),
+              "runId": event.get("runId"),
+              "runAttempt": event.get("runAttempt"),
+              "workflowAuthored": workflow_authored,
+              "prSelfReported": pr_self_reported,
+              "verdict": {
+                  "shaMismatch": workflow_authored["shaMismatch"],
+                  "preinstallExecuted": preinstall_executed,
+                  "toctouProven": bool(workflow_authored["shaMismatch"] and preinstall_executed),
+              },
+              "safety": {
+                  "resourceMutation": False,
+                  "externalExfiltration": False,
+                  "rawTokenOutput": False,
+              },
+          }
+          (evidence / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+      - name: Assert no raw credential material in evidence
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          /usr/bin/python3 - <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          evidence = Path(os.environ["EVIDENCE_DIR"])
+          # JWT shape: three base64url segments, header segment starts with eyJ.
+          jwt = re.compile(rb"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
+          findings = []
+          for path in sorted(evidence.rglob("*")):
+              if not path.is_file():
+                  continue
+              data = path.read_bytes()
+              if jwt.search(data):
+                  findings.append(f"{path.name}: JWT-shaped string")
+          if findings:
+              print("FAIL evidence contains credential-shaped material:")
+              for f in findings:
+                  print(f"  {f}")
+              sys.exit(1)
+          print("PASS no JWT-shaped credential material in evidence")
+          PY
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msrc-toctou-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Assert positive TOCTOU result
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          path = Path(os.environ["EVIDENCE_DIR"]) / "result.json"
+          if not path.exists():
+              print("INCONCLUSIVE: result.json was not produced")
+              sys.exit(1)
+          verdict = json.loads(path.read_text())["verdict"]
+          if not verdict["shaMismatch"]:
+              print("NEGATIVE: checkout resolved to the event head SHA (approval remained bound)")
+              sys.exit(1)
+          if not verdict["preinstallExecuted"]:
+              print("PARTIAL: mutable checkout proven, lifecycle execution NOT proven")
+              sys.exit(1)
+          print("POSITIVE: approval event SHA differed from the executed PR-head SHA")
+          PY
