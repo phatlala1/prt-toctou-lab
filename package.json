@@ -1,8 +1,7 @@
 {
-  "name": "msrc-pr-target-toctou-stage-a",
+  "name": "msrc-pr-target-toctou-stage-c",
   "version": "1.0.0",
   "private": true,
-  "description": "Benign commit A with no package lifecycle script",
+  "description": "NC-03 control: commit B with different content but NO lifecycle script",
   "license": "UNLICENSED"
 }
-
