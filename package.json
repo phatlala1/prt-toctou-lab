@@ -1,0 +1,8 @@
+{
+  "name": "msrc-pr-target-toctou-stage-a",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Benign commit A with no package lifecycle script",
+  "license": "UNLICENSED"
+}
+
