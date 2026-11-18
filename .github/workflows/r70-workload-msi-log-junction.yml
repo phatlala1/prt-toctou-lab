@@ -1,110 +1,19 @@
-name: R70 workload MSI log junction
+name: R70 workload MSI log junction (closed)
 
 on:
-  push:
-    branches:
-      - r70-workload-msi-log-junction
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  runtime:
+  closed:
     runs-on: windows-latest
-    timeout-minutes: 35
-
     steps:
-      - name: Check out laboratory
-        uses: actions/checkout@v4
-
-      - name: Install stock .NET 11 SDK
-        uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: '11.0.100'
-
-      - name: Record host and SDK identity
+      - name: Closure notice
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force evidence | Out-Null
-          dotnet --info 2>&1 | Tee-Object evidence/dotnet-info.txt
-          dotnet --list-sdks 2>&1 | Tee-Object evidence/dotnet-sdks.txt
-          dotnet --list-runtimes 2>&1 | Tee-Object evidence/dotnet-runtimes.txt
-          whoami /all 2>&1 | Tee-Object evidence/whoami.txt
-          Get-CimInstance Win32_OperatingSystem | Format-List * | Out-File evidence/os.txt
-          $dotnet = (Get-Command dotnet).Source
-          Get-FileHash -Algorithm SHA256 $dotnet | Format-List * | Out-File evidence/dotnet-sha256.txt
-          git rev-parse HEAD | Out-File evidence/source-commit.txt
-          Get-ChildItem r70-workload-msi-log-junction -File | Sort-Object Name | Get-FileHash -Algorithm SHA256 | Format-Table -AutoSize | Out-File evidence/source-sha256.txt
-
-      - name: Build current stock-runtime harness
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          dotnet restore r70-workload-msi-log-junction/R70.csproj 2>&1 | Tee-Object evidence/restore.log
-          dotnet build r70-workload-msi-log-junction/R70.csproj -c Release --no-restore 2>&1 | Tee-Object evidence/build.log
-
-      - name: Run three real IPC trials
-        id: runtime
-        continue-on-error: true
-        shell: pwsh
-        env:
-          DOTNET_NOLOGO: '1'
-          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
-          DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $dll = Join-Path $PWD 'r70-workload-msi-log-junction/bin/Release/net11.0-windows/R70.dll'
-          & dotnet $dll orchestrate (Join-Path $PWD 'evidence/runtime') 2>&1 | Tee-Object evidence/runtime-console.log
-          $code = $LASTEXITCODE
-          "runtime_exit_code=$code" | Out-File evidence/runtime-exit.txt
-          exit $code
-
-      - name: Hash complete evidence
-        if: always()
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          Get-ChildItem evidence -File -Recurse |
-            Where-Object Name -ne 'SHA256SUMS.txt' |
-            Sort-Object FullName |
-            ForEach-Object {
-              $relative = [IO.Path]::GetRelativePath((Resolve-Path evidence), $_.FullName)
-              $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
-              "$hash  $relative"
-            } | Out-File evidence/SHA256SUMS.txt -Encoding utf8
-
-      - name: Upload runtime evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: r70-workload-msi-log-junction-evidence
-          path: evidence/
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Surface runtime verdict
-        if: always()
-        shell: pwsh
-        run: |
-          $resultPath = 'evidence/runtime/result.json'
-          if (-not (Test-Path $resultPath)) {
-            Write-Error 'R70 invalid: result.json was not produced.'
-            exit 1
-          }
-
-          $result = Get-Content $resultPath -Raw | ConvertFrom-Json
-          $status = $result.verdict.status
-          Write-Host "R70 status: $status"
-          $result.verdict | ConvertTo-Json -Depth 10
-
-          if ($status -eq 'RUNTIME_POSITIVE_REVIEW_REQUIRED') {
-            Write-Error 'R70 runtime positive: manual review required.'
-            exit 1
-          }
-          if ($status -ne 'RUNTIME_NEGATIVE_OR_INVALID') {
-            Write-Error "R70 unexpected status: $status"
-            exit 1
-          }
+          Write-Host 'R70 is closed for fresh-root research.'
+          Write-Host 'It overlaps the public CVE-2026-45490 workload named-pipe log-path root and CVE-2026-70190 workload link-following family.'
+          Write-Host 'The hosted runtime attempt was invalid because the real server pipes timed out before the restricted client connected.'
           exit 0
