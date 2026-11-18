@@ -63,6 +63,15 @@ jobs:
             -inkey r64.key -in r64.crt -passout pass:r64-owned-lab
           sha256sum r64.pfx > evidence/certificate-sha256.txt
 
+      - name: Apply deterministic harness source repair
+        shell: bash
+        working-directory: r64-dotnet11-csrf-browser-matrix
+        run: |
+          set -euo pipefail
+          python3 fix-attack-pages.py | tee evidence/source-repair.log
+          cp Program.cs evidence/Program.patched.cs
+          sha256sum Program.cs fix-attack-pages.py > evidence/source-sha256.txt
+
       - name: Build stock application
         shell: bash
         working-directory: r64-dotnet11-csrf-browser-matrix
