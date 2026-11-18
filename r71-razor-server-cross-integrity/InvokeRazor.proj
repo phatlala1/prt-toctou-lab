@@ -1,0 +1,33 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <UsingTask TaskName="Microsoft.AspNetCore.Razor.Tasks.SdkRazorGenerate" AssemblyFile="$(RazorTasksAssembly)" />
+
+  <Target Name="Run">
+    <ItemGroup>
+      <R71Configuration Include="Default" />
+      <R71Extension Include="R71Extension" Condition="'$(IncludeExtension)' == 'true'">
+        <AssemblyName>R71Extension</AssemblyName>
+        <AssemblyFilePath>$(ExtensionPath)</AssemblyFilePath>
+      </R71Extension>
+      <R71Source Include="$(SourcePath)">
+        <FullPath>$(SourcePath)</FullPath>
+        <GeneratedOutput>generated.cs</GeneratedOutput>
+        <TargetPath>Index.cshtml</TargetPath>
+        <DocumentKind>mvc</DocumentKind>
+      </R71Source>
+    </ItemGroup>
+
+    <Microsoft.AspNetCore.Razor.Tasks.SdkRazorGenerate
+      ToolAssembly="$(RzcPath)"
+      ToolExe="$(DotnetPath)"
+      UseServer="$(UseServer)"
+      ForceServer="$(ForceServer)"
+      PipeName="$(PipeName)"
+      Version="11.0"
+      Configuration="@(R71Configuration)"
+      Extensions="@(R71Extension)"
+      Sources="@(R71Source)"
+      ProjectRoot="$(WorkDirectory)"
+      TagHelperManifest="$(TagHelperManifest)"
+      RootNamespace="R71.Generated" />
+  </Target>
+</Project>
