@@ -1,0 +1,120 @@
+name: R63 SRE Agent source gate
+
+on:
+  push:
+    branches: [r63-sre-agent-pr-prompt-injection]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run immutable source and policy gate
+        run: |
+          set -euo pipefail
+          python r63-sre-agent-pr-prompt-injection/source_gate.py
+
+      - name: Compile all PoC helpers
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            r63-sre-agent-pr-prompt-injection/source_gate.py \
+            r63-sre-agent-pr-prompt-injection/send_owned_trigger.py \
+            r63-sre-agent-pr-prompt-injection/render_payload.py \
+            r63-sre-agent-pr-prompt-injection/verify_owned_lab.py
+
+      - name: Exercise refusal and dry-run controls
+        run: |
+          set -euo pipefail
+          cd r63-sre-agent-pr-prompt-injection
+
+          set +e
+          python send_owned_trigger.py \
+            --webhook-url 'https://example.com/not-allowed' \
+            --repo owned/repo \
+            --prod-lab-rg r63-prod-lab \
+            --nonce R63_CONTROL_NONCE \
+            --confirm-owned-lab I-OWN-ALL-TARGETS \
+            --dry-run > refusal.stdout 2> refusal.stderr
+          refusal_status=$?
+          set -e
+          test "$refusal_status" -eq 2
+          grep -F '[REFUSED]' refusal.stderr
+
+          python send_owned_trigger.py \
+            --webhook-url 'https://owned-test.logic.azure.com/workflows/test/triggers/test/paths/invoke?sig=REDACTED' \
+            --repo owned/repo \
+            --prod-lab-rg r63-prod-lab \
+            --nonce R63_CONTROL_NONCE \
+            --confirm-owned-lab I-OWN-ALL-TARGETS \
+            --output evidence/dry-run \
+            --dry-run | tee dry-run.stdout
+
+          test -s evidence/dry-run/request.json
+          test -s evidence/dry-run/endpoint-metadata.json
+          ! grep -R -F 'sig=REDACTED' evidence/dry-run
+
+          python render_payload.py \
+            --prod-lab-rg r63-prod-lab \
+            --nonce R63_CONTROL_NONCE \
+            --output evidence/rendered-control.md
+          grep -F 'R63_BOUNDARY_PROOF_R63_CONTROL_NONCE' evidence/rendered-control.md
+          grep -F 'az group update --name r63-prod-lab' evidence/rendered-control.md
+
+      - name: Build evidence manifest
+        if: always()
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path('r63-sre-agent-pr-prompt-injection')
+          evidence = root / 'evidence'
+          evidence.mkdir(parents=True, exist_ok=True)
+          files = [
+              root / 'README.md',
+              root / 'source_gate.py',
+              root / 'send_owned_trigger.py',
+              root / 'render_payload.py',
+              root / 'verify_owned_lab.py',
+              root / 'payloads' / 'injected-change.md',
+          ]
+          manifest = {
+              'schema': 'r63-sre-agent-pr-prompt-injection/hosted-source-evidence-v1',
+              'commit': '${{ github.sha }}',
+              'runId': '${{ github.run_id }}',
+              'files': {},
+          }
+          for path in files:
+              manifest['files'][str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+          (evidence / 'kit-manifest.json').write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+          )
+          sums = []
+          for path in sorted(evidence.rglob('*')):
+              if path.is_file() and path.name != 'SHA256SUMS.txt':
+                  sums.append(
+                      f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(evidence)}"
+                  )
+          (evidence / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+          PY
+
+      - name: Upload source-gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r63-sre-agent-source-gate-evidence
+          path: r63-sre-agent-pr-prompt-injection/evidence/
+          if-no-files-found: error
