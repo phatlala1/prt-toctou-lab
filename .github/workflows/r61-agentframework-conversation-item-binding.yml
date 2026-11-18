@@ -1,0 +1,265 @@
+name: R61 Agent Framework conversation item binding
+
+on:
+  push:
+    branches: [r61-agentframework-conversation-item-binding]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build published packages
+        run: |
+          set -euo pipefail
+          dotnet --info | tee dotnet-info.txt
+          dotnet restore r60-agentframework-store-false/R60AgentFramework.csproj
+          dotnet build r60-agentframework-store-false/R60AgentFramework.csproj --no-restore -c Release
+          dotnet list r60-agentframework-store-false/R60AgentFramework.csproj package --include-transitive | tee package-graph.txt
+
+      - name: Execute nested-resource binding probe
+        run: |
+          set -euo pipefail
+          ASPNETCORE_URLS=http://127.0.0.1:5091 \
+            dotnet run --project r60-agentframework-store-false/R60AgentFramework.csproj \
+              --no-build -c Release > server.log 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 90); do
+            curl -fsS http://127.0.0.1:5091/ready > ready.json && break
+            sleep 1
+          done
+          test -s ready.json || { cat server.log; exit 1; }
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          def request(text, owner):
+              return {
+                  "metadata": {"synthetic_owner": owner},
+                  "items": [{
+                      "type": "message",
+                      "role": "user",
+                      "content": [{"type": "input_text", "text": text}],
+                  }],
+              }
+
+          Path("alice-a-create.json").write_text(json.dumps(request("R61_ALICE_A_PRIVATE", "alice")) + "\n")
+          Path("alice-b-create.json").write_text(json.dumps(request("R61_ALICE_B_PRIVATE", "alice")) + "\n")
+          Path("bob-create.json").write_text(json.dumps(request("R61_BOB_PRIVATE", "bob")) + "\n")
+          PY
+
+          create_conversation() {
+            local user="$1" body="$2" output="$3" headers="$4"
+            curl -sS -o "$output" -D "$headers" -w '%{http_code}' \
+              -H "X-R61-Test-User: $user" \
+              -H 'Content-Type: application/json' \
+              --data-binary "@$body" \
+              http://127.0.0.1:5091/v1/conversations
+          }
+
+          alice_a_create_status=$(create_conversation alice alice-a-create.json alice-a-conversation.json alice-a-conversation.headers)
+          alice_b_create_status=$(create_conversation alice alice-b-create.json alice-b-conversation.json alice-b-conversation.headers)
+          bob_create_status=$(create_conversation bob bob-create.json bob-conversation.json bob-conversation.headers)
+
+          ALICE_A_CREATE_STATUS="$alice_a_create_status" \
+          ALICE_B_CREATE_STATUS="$alice_b_create_status" \
+          BOB_CREATE_STATUS="$bob_create_status" \
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          entries = [
+              ("alice-a", "ALICE_A_CREATE_STATUS", "alice-a-conversation.json", "alice-a-conversation.id"),
+              ("alice-b", "ALICE_B_CREATE_STATUS", "alice-b-conversation.json", "alice-b-conversation.id"),
+              ("bob", "BOB_CREATE_STATUS", "bob-conversation.json", "bob-conversation.id"),
+          ]
+          for label, env_name, source, target in entries:
+              status = os.environ[env_name]
+              body = Path(source).read_text(errors="replace")
+              if status != "200":
+                  raise SystemExit(f"{label} conversation create failed: {status}: {body}")
+              data = json.loads(body)
+              conversation_id = data.get("id")
+              if not isinstance(conversation_id, str) or not conversation_id.startswith("conv_"):
+                  raise SystemExit(f"{label} missing conversation ID: {data}")
+              Path(target).write_text(conversation_id + "\n")
+          PY
+
+          alice_a=$(tr -d '\r\n' < alice-a-conversation.id)
+          alice_b=$(tr -d '\r\n' < alice-b-conversation.id)
+          bob=$(tr -d '\r\n' < bob-conversation.id)
+
+          list_items() {
+            local user="$1" conversation="$2" output="$3" headers="$4"
+            curl -sS -o "$output" -D "$headers" -w '%{http_code}' \
+              -H "X-R61-Test-User: $user" \
+              "http://127.0.0.1:5091/v1/conversations/${conversation}/items?order=asc&limit=100"
+          }
+
+          alice_a_list_status=$(list_items alice "$alice_a" alice-a-items.json alice-a-items.headers)
+          alice_b_list_status=$(list_items alice "$alice_b" alice-b-items.json alice-b-items.headers)
+          bob_list_status=$(list_items bob "$bob" bob-items.json bob-items.headers)
+
+          ALICE_A_LIST_STATUS="$alice_a_list_status" \
+          ALICE_B_LIST_STATUS="$alice_b_list_status" \
+          BOB_LIST_STATUS="$bob_list_status" \
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          cases = [
+              ("alice-a", "ALICE_A_LIST_STATUS", "alice-a-items.json", "R61_ALICE_A_PRIVATE", "alice-a-item.id"),
+              ("alice-b", "ALICE_B_LIST_STATUS", "alice-b-items.json", "R61_ALICE_B_PRIVATE", "alice-b-item.id"),
+              ("bob", "BOB_LIST_STATUS", "bob-items.json", "R61_BOB_PRIVATE", "bob-item.id"),
+          ]
+
+          def contains_marker(value, marker):
+              if isinstance(value, str):
+                  return marker in value
+              if isinstance(value, list):
+                  return any(contains_marker(v, marker) for v in value)
+              if isinstance(value, dict):
+                  return any(contains_marker(v, marker) for v in value.values())
+              return False
+
+          for label, env_name, source, marker, target in cases:
+              status = os.environ[env_name]
+              body = Path(source).read_text(errors="replace")
+              if status != "200":
+                  raise SystemExit(f"{label} item list failed: {status}: {body}")
+              data = json.loads(body)
+              matching = [item for item in data.get("data", []) if contains_marker(item, marker)]
+              if len(matching) != 1 or not isinstance(matching[0].get("id"), str):
+                  raise SystemExit(f"{label} marker item not uniquely found: {data}")
+              Path(target).write_text(matching[0]["id"] + "\n")
+          PY
+
+          alice_a_item=$(tr -d '\r\n' < alice-a-item.id)
+          alice_b_item=$(tr -d '\r\n' < alice-b-item.id)
+          bob_item=$(tr -d '\r\n' < bob-item.id)
+
+          get_item() {
+            local user="$1" conversation="$2" item="$3" output="$4" headers="$5"
+            curl -sS -o "$output" -D "$headers" -w '%{http_code}' \
+              -H "X-R61-Test-User: $user" \
+              "http://127.0.0.1:5091/v1/conversations/${conversation}/items/${item}"
+          }
+
+          alice_correct_status=$(get_item alice "$alice_a" "$alice_a_item" alice-correct-get.json alice-correct-get.headers)
+          bob_correct_status=$(get_item bob "$bob" "$bob_item" bob-correct-get.json bob-correct-get.headers)
+          alice_wrong_parent_status=$(get_item alice "$alice_b" "$alice_a_item" alice-wrong-parent-get.json alice-wrong-parent-get.headers)
+          bob_victim_parent_status=$(get_item bob "$alice_a" "$alice_a_item" bob-victim-parent-get.json bob-victim-parent-get.headers)
+          bob_own_parent_victim_item_status=$(get_item bob "$bob" "$alice_a_item" bob-own-parent-victim-item-get.json bob-own-parent-victim-item-get.headers)
+
+          delete_item() {
+            local user="$1" conversation="$2" item="$3" output="$4" headers="$5"
+            curl -sS -X DELETE -o "$output" -D "$headers" -w '%{http_code}' \
+              -H "X-R61-Test-User: $user" \
+              "http://127.0.0.1:5091/v1/conversations/${conversation}/items/${item}"
+          }
+
+          alice_wrong_parent_delete_status=$(delete_item alice "$alice_b" "$alice_a_item" alice-wrong-parent-delete.json alice-wrong-parent-delete.headers)
+          bob_own_parent_victim_item_delete_status=$(delete_item bob "$bob" "$alice_a_item" bob-own-parent-victim-item-delete.json bob-own-parent-victim-item-delete.headers)
+          alice_after_delete_status=$(get_item alice "$alice_a" "$alice_a_item" alice-after-delete-get.json alice-after-delete-get.headers)
+
+          ALICE_CORRECT_STATUS="$alice_correct_status" \
+          BOB_CORRECT_STATUS="$bob_correct_status" \
+          ALICE_WRONG_PARENT_STATUS="$alice_wrong_parent_status" \
+          BOB_VICTIM_PARENT_STATUS="$bob_victim_parent_status" \
+          BOB_OWN_PARENT_VICTIM_ITEM_STATUS="$bob_own_parent_victim_item_status" \
+          ALICE_WRONG_PARENT_DELETE_STATUS="$alice_wrong_parent_delete_status" \
+          BOB_OWN_PARENT_VICTIM_ITEM_DELETE_STATUS="$bob_own_parent_victim_item_delete_status" \
+          ALICE_AFTER_DELETE_STATUS="$alice_after_delete_status" \
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def load(path):
+              try:
+                  return json.loads(Path(path).read_text())
+              except Exception:
+                  return Path(path).read_text(errors="replace") if Path(path).exists() else None
+
+          result = {
+              "schema": "r61-agentframework-conversation-item-binding/v1",
+              "ids": {
+                  "aliceConversationA": Path("alice-a-conversation.id").read_text().strip(),
+                  "aliceConversationB": Path("alice-b-conversation.id").read_text().strip(),
+                  "bobConversation": Path("bob-conversation.id").read_text().strip(),
+                  "aliceItemA": Path("alice-a-item.id").read_text().strip(),
+                  "aliceItemB": Path("alice-b-item.id").read_text().strip(),
+                  "bobItem": Path("bob-item.id").read_text().strip(),
+              },
+              "controls": {
+                  "aliceCorrectGetStatus": int(os.environ["ALICE_CORRECT_STATUS"]),
+                  "bobCorrectGetStatus": int(os.environ["BOB_CORRECT_STATUS"]),
+              },
+              "sameUserWrongParent": {
+                  "getStatus": int(os.environ["ALICE_WRONG_PARENT_STATUS"]),
+                  "getBody": load("alice-wrong-parent-get.json"),
+                  "deleteStatus": int(os.environ["ALICE_WRONG_PARENT_DELETE_STATUS"]),
+                  "deleteBody": load("alice-wrong-parent-delete.json"),
+              },
+              "crossUser": {
+                  "victimParentGetStatus": int(os.environ["BOB_VICTIM_PARENT_STATUS"]),
+                  "victimParentGetBody": load("bob-victim-parent-get.json"),
+                  "ownParentVictimItemGetStatus": int(os.environ["BOB_OWN_PARENT_VICTIM_ITEM_STATUS"]),
+                  "ownParentVictimItemGetBody": load("bob-own-parent-victim-item-get.json"),
+                  "ownParentVictimItemDeleteStatus": int(os.environ["BOB_OWN_PARENT_VICTIM_ITEM_DELETE_STATUS"]),
+                  "ownParentVictimItemDeleteBody": load("bob-own-parent-victim-item-delete.json"),
+              },
+              "victimAfterUnauthorizedDelete": {
+                  "getStatus": int(os.environ["ALICE_AFTER_DELETE_STATUS"]),
+                  "getBody": load("alice-after-delete-get.json"),
+              },
+          }
+          Path("result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(result, indent=2, sort_keys=True))
+
+          assert result["controls"]["aliceCorrectGetStatus"] == 200
+          assert result["controls"]["bobCorrectGetStatus"] == 200
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r61-agentframework-conversation-item-binding-evidence
+          path: |
+            dotnet-info.txt
+            package-graph.txt
+            server.log
+            ready.json
+            *-create.json
+            *-conversation.json
+            *-conversation.headers
+            *-conversation.id
+            *-items.json
+            *-items.headers
+            *-item.id
+            *-get.json
+            *-get.headers
+            *-delete.json
+            *-delete.headers
+            result.json
+          if-no-files-found: warn
