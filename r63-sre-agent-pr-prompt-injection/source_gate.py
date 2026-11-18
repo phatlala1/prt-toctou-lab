@@ -19,7 +19,8 @@ from typing import Any
 
 PIN = "6c6c48b4ff558f6b6858e2eb6a3a34198f3f6bc0"
 RAW = f"https://raw.githubusercontent.com/microsoft/sre-agent/{PIN}"
-OUT = Path("evidence/source-gate")
+BASE = Path(__file__).resolve().parent
+OUT = BASE / "evidence" / "source-gate"
 
 FILES = {
     "active_workflow": f"{RAW}/.github/workflows/sre-agent-pr-validation.yml",
@@ -114,7 +115,7 @@ def main() -> int:
         sources[name] = {
             "url": url,
             "sha256": sha256,
-            "savedAs": str(output),
+            "savedAs": str(output.relative_to(BASE)),
         }
 
     workflow = texts["active_workflow"]
