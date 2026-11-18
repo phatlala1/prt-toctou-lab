@@ -1,0 +1,126 @@
+name: R59 CacheView VaryByUser hosted PoC
+
+on:
+  push:
+    branches:
+      - r59-cacheview-varybyuser
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install .NET 11 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 11.0.x
+
+      - name: Record runtime
+        run: |
+          set -euo pipefail
+          dotnet --info | tee dotnet-info.txt
+
+      - name: Build harness
+        run: |
+          set -euo pipefail
+          dotnet restore r59-cacheview-poc/R59CacheView.csproj
+          dotnet build r59-cacheview-poc/R59CacheView.csproj --no-restore -c Release
+
+      - name: Execute end-to-end collision and control
+        run: |
+          set -euo pipefail
+          cd r59-cacheview-poc
+          ASPNETCORE_URLS=http://127.0.0.1:5089 dotnet run --no-build -c Release > ../server.log 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:5089/__ready >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != "1" ]]; then
+            cat ../server.log
+            exit 1
+          fi
+
+          curl -fsS 'http://127.0.0.1:5089/collision?u=alice' -o ../collision-alice.html
+          sleep 1
+          curl -fsS 'http://127.0.0.1:5089/collision?u=bob' -o ../collision-bob.html
+
+          curl -fsS 'http://127.0.0.1:5089/control?u=alice' -o ../control-alice.html
+          sleep 1
+          curl -fsS 'http://127.0.0.1:5089/control?u=bob' -o ../control-bob.html
+
+          cd ..
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          files = {
+              "collisionAlice": "collision-alice.html",
+              "collisionBob": "collision-bob.html",
+              "controlAlice": "control-alice.html",
+              "controlBob": "control-bob.html",
+          }
+
+          observed = {}
+          for key, filename in files.items():
+              text = Path(filename).read_text(errors="replace")
+              matches = re.findall(r"secret-(alice|bob)", text)
+              if not matches:
+                  raise SystemExit(f"No synthetic user marker found in {filename}")
+              observed[key] = matches[-1]
+
+          result = {
+              "schema": "r59-cacheview-varybyuser/v1",
+              "collision": {
+                  "firstRequestUser": observed["collisionAlice"],
+                  "secondRequestRequestedUser": "bob",
+                  "secondResponseRenderedUser": observed["collisionBob"],
+                  "crossUserReplayObserved": observed["collisionBob"] == "alice",
+              },
+              "control": {
+                  "firstRequestUser": observed["controlAlice"],
+                  "secondRequestRequestedUser": "bob",
+                  "secondResponseRenderedUser": observed["controlBob"],
+                  "uniquePrimaryNameIdentifierSeparatedUsers": observed["controlBob"] == "bob",
+              },
+          }
+          Path("result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(result, indent=2, sort_keys=True))
+
+          assert observed["collisionAlice"] == "alice"
+          assert observed["collisionBob"] == "alice", "Expected CacheView to replay Alice content to Bob for the collision model"
+          assert observed["controlAlice"] == "alice"
+          assert observed["controlBob"] == "bob", "Control must separate users with unique primary NameIdentifier claims"
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r59-cacheview-varybyuser-evidence
+          path: |
+            dotnet-info.txt
+            server.log
+            collision-alice.html
+            collision-bob.html
+            control-alice.html
+            control-bob.html
+            result.json
+          if-no-files-found: warn
