@@ -1,0 +1,240 @@
+name: R60 Agent Framework store=false hosted PoC
+
+on:
+  push:
+    branches:
+      - r60-agentframework-store-false
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore and build published packages
+        run: |
+          set -euo pipefail
+          dotnet --info | tee dotnet-info.txt
+          dotnet restore r60-agentframework-store-false/R60AgentFramework.csproj
+          dotnet build r60-agentframework-store-false/R60AgentFramework.csproj --no-restore -c Release
+          dotnet list r60-agentframework-store-false/R60AgentFramework.csproj package --include-transitive | tee package-graph.txt
+
+      - name: Execute end-to-end persistence probe
+        run: |
+          set -euo pipefail
+          ASPNETCORE_URLS=http://127.0.0.1:5090 \
+            dotnet run --project r60-agentframework-store-false/R60AgentFramework.csproj \
+              --no-build -c Release > server.log 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for _ in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:5090/ready > ready.json; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != "1" ]]; then
+            cat server.log
+            exit 1
+          fi
+
+          cat > request-store-false.json <<'JSON'
+          {
+            "model": "assistant",
+            "input": "R60_PRIVATE_INPUT_STORE_FALSE",
+            "store": false,
+            "stream": false
+          }
+          JSON
+
+          cat > request-store-true.json <<'JSON'
+          {
+            "model": "assistant",
+            "input": "R60_CONTROL_INPUT_STORE_TRUE",
+            "store": true,
+            "stream": false
+          }
+          JSON
+
+          false_post_status=$(curl -sS \
+            -o response-store-false.json \
+            -D response-store-false.headers \
+            -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            --data-binary @request-store-false.json \
+            http://127.0.0.1:5090/v1/responses)
+
+          true_post_status=$(curl -sS \
+            -o response-store-true.json \
+            -D response-store-true.headers \
+            -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            --data-binary @request-store-true.json \
+            http://127.0.0.1:5090/v1/responses)
+
+          FALSE_POST_STATUS="$false_post_status" TRUE_POST_STATUS="$true_post_status" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          if os.environ["FALSE_POST_STATUS"] != "200":
+              raise SystemExit(f"store=false POST failed: {os.environ['FALSE_POST_STATUS']}\n{Path('response-store-false.json').read_text(errors='replace')}")
+          if os.environ["TRUE_POST_STATUS"] != "200":
+              raise SystemExit(f"store=true POST failed: {os.environ['TRUE_POST_STATUS']}\n{Path('response-store-true.json').read_text(errors='replace')}")
+
+          for source, target in [
+              ("response-store-false.json", "response-store-false.id"),
+              ("response-store-true.json", "response-store-true.id"),
+          ]:
+              data = json.loads(Path(source).read_text())
+              response_id = data.get("id")
+              if not isinstance(response_id, str) or not response_id.startswith("resp_"):
+                  raise SystemExit(f"Missing response id in {source}: {data}")
+              Path(target).write_text(response_id + "\n")
+          PY
+
+          false_id=$(tr -d '\r\n' < response-store-false.id)
+          true_id=$(tr -d '\r\n' < response-store-true.id)
+
+          false_get_status=$(curl -sS \
+            -o get-store-false.json \
+            -D get-store-false.headers \
+            -w '%{http_code}' \
+            "http://127.0.0.1:5090/v1/responses/${false_id}")
+
+          true_get_status=$(curl -sS \
+            -o get-store-true.json \
+            -D get-store-true.headers \
+            -w '%{http_code}' \
+            "http://127.0.0.1:5090/v1/responses/${true_id}")
+
+          false_input_status=$(curl -sS \
+            -o input-items-store-false.json \
+            -D input-items-store-false.headers \
+            -w '%{http_code}' \
+            "http://127.0.0.1:5090/v1/responses/${false_id}/input_items")
+
+          true_input_status=$(curl -sS \
+            -o input-items-store-true.json \
+            -D input-items-store-true.headers \
+            -w '%{http_code}' \
+            "http://127.0.0.1:5090/v1/responses/${true_id}/input_items")
+
+          FALSE_POST_STATUS="$false_post_status" \
+          TRUE_POST_STATUS="$true_post_status" \
+          FALSE_GET_STATUS="$false_get_status" \
+          TRUE_GET_STATUS="$true_get_status" \
+          FALSE_INPUT_STATUS="$false_input_status" \
+          TRUE_INPUT_STATUS="$true_input_status" \
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def load_json(path):
+              try:
+                  return json.loads(Path(path).read_text())
+              except Exception:
+                  return None
+
+          false_post = load_json("response-store-false.json")
+          true_post = load_json("response-store-true.json")
+          false_get = load_json("get-store-false.json")
+          true_get = load_json("get-store-true.json")
+          false_items = load_json("input-items-store-false.json")
+          true_items = load_json("input-items-store-true.json")
+
+          result = {
+              "schema": "r60-agentframework-store-false/v1",
+              "publishedPackages": {
+                  "Microsoft.Agents.AI.Hosting": "1.28.0-preview.261106.1",
+                  "Microsoft.Agents.AI.Hosting.OpenAI": "1.28.0-alpha.261106.1",
+              },
+              "storeFalse": {
+                  "postStatus": int(os.environ["FALSE_POST_STATUS"]),
+                  "responseId": Path("response-store-false.id").read_text().strip(),
+                  "responseStoreField": false_post.get("store") if isinstance(false_post, dict) else None,
+                  "getStatus": int(os.environ["FALSE_GET_STATUS"]),
+                  "inputItemsStatus": int(os.environ["FALSE_INPUT_STATUS"]),
+                  "getBody": false_get,
+                  "inputItemsBody": false_items,
+              },
+              "storeTrueControl": {
+                  "postStatus": int(os.environ["TRUE_POST_STATUS"]),
+                  "responseId": Path("response-store-true.id").read_text().strip(),
+                  "responseStoreField": true_post.get("store") if isinstance(true_post, dict) else None,
+                  "getStatus": int(os.environ["TRUE_GET_STATUS"]),
+                  "inputItemsStatus": int(os.environ["TRUE_INPUT_STATUS"]),
+                  "getBody": true_get,
+                  "inputItemsBody": true_items,
+              },
+          }
+          result["observations"] = {
+              "storeFalseResponseRetrievable": result["storeFalse"]["getStatus"] == 200,
+              "storeFalseInputItemsRetrievable": result["storeFalse"]["inputItemsStatus"] == 200,
+              "storeTrueControlRetrievable": result["storeTrueControl"]["getStatus"] == 200,
+              "storeTrueControlInputItemsRetrievable": result["storeTrueControl"]["inputItemsStatus"] == 200,
+          }
+
+          Path("result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(result, indent=2, sort_keys=True))
+
+          assert result["storeFalse"]["postStatus"] == 200
+          assert result["storeTrueControl"]["postStatus"] == 200
+          assert result["observations"]["storeTrueControlRetrievable"], "store=true control was not retrievable"
+          assert result["observations"]["storeTrueControlInputItemsRetrievable"], "store=true input-items control was not retrievable"
+          PY
+
+          # Best-effort owned-lab cleanup after evidence has been recorded.
+          curl -sS -X DELETE "http://127.0.0.1:5090/v1/responses/${false_id}" -o delete-store-false.json -w '%{http_code}\n' > delete-store-false.status || true
+          curl -sS -X DELETE "http://127.0.0.1:5090/v1/responses/${true_id}" -o delete-store-true.json -w '%{http_code}\n' > delete-store-true.status || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r60-agentframework-store-false-evidence
+          path: |
+            dotnet-info.txt
+            package-graph.txt
+            server.log
+            ready.json
+            request-store-false.json
+            request-store-true.json
+            response-store-false.json
+            response-store-false.headers
+            response-store-false.id
+            response-store-true.json
+            response-store-true.headers
+            response-store-true.id
+            get-store-false.json
+            get-store-false.headers
+            get-store-true.json
+            get-store-true.headers
+            input-items-store-false.json
+            input-items-store-false.headers
+            input-items-store-true.json
+            input-items-store-true.headers
+            delete-store-false.json
+            delete-store-false.status
+            delete-store-true.json
+            delete-store-true.status
+            result.json
+          if-no-files-found: warn
