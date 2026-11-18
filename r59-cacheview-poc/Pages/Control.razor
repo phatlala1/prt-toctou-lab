@@ -1,0 +1,6 @@
+@page "/control"
+@inject IHttpContextAccessor HttpContextAccessor
+
+<CacheView VaryByUser="true" CacheKey="r59-control" ExpiresAfter="@TimeSpan.FromMinutes(10)">
+    <div id="cached-user">secret-@HttpContextAccessor.HttpContext!.User.Identity!.Name</div>
+</CacheView>
