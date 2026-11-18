@@ -69,7 +69,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 fix-attack-pages.py | tee evidence/source-repair.log
-          cp Program.cs evidence/Program.patched.cs
+          cp Program.cs evidence/Program.patched.txt
           sha256sum Program.cs fix-attack-pages.py > evidence/source-sha256.txt
 
       - name: Build stock application
