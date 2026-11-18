@@ -3,8 +3,14 @@ from pathlib import Path
 
 program = Path("Program.cs")
 source = program.read_text(encoding="utf-8")
-marker = "internal static class AttackPages\n{"
 
+nullable_old = "            Host = context.Request.Host.Value,\n"
+nullable_new = "            Host = context.Request.Host.Value ?? string.Empty,\n"
+if source.count(nullable_old) != 1:
+    raise SystemExit("HostString nullable assignment count was not exactly one")
+source = source.replace(nullable_old, nullable_new, 1)
+
+marker = "internal static class AttackPages\n{"
 if source.count(marker) != 1:
     raise SystemExit("AttackPages marker count was not exactly one")
 
@@ -102,4 +108,4 @@ replacement = r'''internal static class AttackPages
 
 prefix = source[: source.index(marker)]
 program.write_text(prefix + replacement, encoding="utf-8")
-print("R64_ATTACK_PAGES_PATCHED")
+print("R64_NULLABLE_AND_ATTACK_PAGES_PATCHED")
