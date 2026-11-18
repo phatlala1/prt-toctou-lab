@@ -1,0 +1,139 @@
+name: R61 ASP.NET Core antiforgery differential
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "r61-antiforgery/**"
+      - ".github/workflows/r61-antiforgery.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out lab
+        uses: actions/checkout@v4
+
+      - name: Install stock .NET 11 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "11.0.x"
+
+      - name: Capture runtime identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          dotnet --info | tee evidence/dotnet-info.txt
+          dotnet --list-runtimes | tee evidence/dotnet-runtimes.txt
+          dotnet --list-sdks | tee evidence/dotnet-sdks.txt
+          uname -a | tee evidence/runner-uname.txt
+
+      - name: Build generated and runtime variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet publish r61-antiforgery/R61.csproj \
+            -c Release \
+            -o r61-antiforgery/out-rdg \
+            /p:EnableRequestDelegateGenerator=true \
+            /p:EmitCompilerGeneratedFiles=true \
+            /p:CompilerGeneratedFilesOutputPath="$PWD/evidence/generated-rdg" \
+            2>&1 | tee evidence/build-rdg.log
+
+          dotnet publish r61-antiforgery/R61.csproj \
+            -c Release \
+            -o r61-antiforgery/out-rdf \
+            /p:EnableRequestDelegateGenerator=false \
+            /p:EmitCompilerGeneratedFiles=true \
+            /p:CompilerGeneratedFilesOutputPath="$PWD/evidence/generated-rdf" \
+            2>&1 | tee evidence/build-rdf.log
+
+          find evidence/generated-rdg -type f -print | sort > evidence/generated-rdg-files.txt || true
+          find evidence/generated-rdf -type f -print | sort > evidence/generated-rdf-files.txt || true
+
+      - name: Run real Kestrel probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          export R61_RUNTIME="$(dotnet --version)"
+
+          run_mode() {
+            local mode="$1"
+            local port="$2"
+            local assembly="$3"
+            local base="http://127.0.0.1:${port}"
+
+            export R61_MODE="$mode"
+            export R61_LOG="$PWD/evidence/invocations-${mode}.jsonl"
+            : > "$R61_LOG"
+
+            dotnet "$assembly" --urls "$base" > "evidence/server-${mode}.log" 2>&1 &
+            local server_pid=$!
+            trap 'kill "$server_pid" 2>/dev/null || true' RETURN
+
+            python3 r61-antiforgery/probe.py \
+              --base "$base" \
+              --mode "$mode" \
+              --log "$R61_LOG" \
+              --out "evidence/results-${mode}.json" \
+              | tee "evidence/probe-${mode}.log"
+
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+            trap - RETURN
+          }
+
+          run_mode rdg 5161 r61-antiforgery/out-rdg/R61.dll
+          run_mode rdf 5162 r61-antiforgery/out-rdf/R61.dll
+
+      - name: Compare RDG and RDF security behavior
+        id: compare
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 r61-antiforgery/compare.py \
+            --rdg evidence/results-rdg.json \
+            --rdf evidence/results-rdf.json \
+            --out evidence/comparison.json \
+            2>&1 | tee evidence/compare.log
+
+      - name: Hash evidence
+        if: always()
+        shell: bash
+        run: |
+          find evidence -type f -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            > evidence/SHA256SUMS.txt || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r61-antiforgery-evidence
+          path: evidence
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Surface confirmed bypass
+        if: always()
+        shell: bash
+        run: |
+          if [[ ! -f evidence/comparison.json ]]; then
+            echo "R61 inconclusive: comparison evidence was not produced."
+            exit 1
+          fi
+
+          verdict="$(python3 -c 'import json; print(json.load(open("evidence/comparison.json"))["verdict"])')"
+          echo "R61 verdict: $verdict"
+          if [[ "$verdict" == POSITIVE* ]]; then
+            exit 1
+          fi
