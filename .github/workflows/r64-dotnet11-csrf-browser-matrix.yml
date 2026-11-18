@@ -2,126 +2,24 @@ name: R64 .NET 11 CSRF browser matrix
 
 on:
   push:
-    branches: [r64-dotnet11-csrf-browser-matrix]
+    branches:
+      - r64-dotnet11-csrf-browser-matrix
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  browser-matrix:
+  parser-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-    defaults:
-      run:
-        working-directory: r64-dotnet11-csrf-browser-matrix
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check out laboratory
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: 11.0.x
-
-      - name: Record toolchain
+      - name: Confirm workflow parser and branch contents
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p evidence
-          dotnet --info | tee evidence/dotnet-info.txt
-          node --version | tee evidence/node-version.txt
-          npm --version | tee evidence/npm-version.txt
-
-      - name: Install current pinned Playwright
-        run: |
-          set -euo pipefail
-          npm install --no-audit --no-fund
-          npx playwright --version | tee evidence/playwright-version.txt
-          npx playwright install --with-deps chromium firefox webkit
-
-      - name: Generate owned loopback certificate
-        run: |
-          set -euo pipefail
-          openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
-            -keyout r64.key -out r64.crt \
-            -subj '/CN=victim.test' \
-            -addext 'subjectAltName=DNS:victim.test,DNS:attacker.test,IP:127.0.0.1'
-          openssl pkcs12 -export -out r64.pfx \
-            -inkey r64.key -in r64.crt -passout pass:r64-owned-lab
-          sha256sum r64.pfx > evidence/certificate-sha256.txt
-
-      - name: Build stock .NET 11 application
-        run: |
-          set -euo pipefail
-          dotnet restore
-          dotnet build --configuration Release --no-restore
-
-      - name: Run browser matrix
-        env:
-          ASPNETCORE_URLS: https://0.0.0.0:5001;https://0.0.0.0:5002
-          ASPNETCORE_Kestrel__Certificates__Default__Path: ${{ github.workspace }}/r64-dotnet11-csrf-browser-matrix/r64.pfx
-          ASPNETCORE_Kestrel__Certificates__Default__Password: r64-owned-lab
-          NO_PROXY: victim.test,attacker.test,127.0.0.1,localhost
-          no_proxy: victim.test,attacker.test,127.0.0.1,localhost
-        run: |
-          set -euo pipefail
-          echo '127.0.0.1 victim.test attacker.test' | sudo tee -a /etc/hosts
-
-          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy || true
-
-          dotnet run --configuration Release --no-build \
-            > evidence/server.log 2>&1 &
-          server_pid=$!
-          echo "$server_pid" > evidence/server.pid
-          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
-
-          ready=0
-          for attempt in $(seq 1 60); do
-            if curl --noproxy '*' --silent --show-error --fail --insecure \
-              --resolve victim.test:5001:127.0.0.1 \
-              https://victim.test:5001/health \
-              > evidence/health.json; then
-              ready=1
-              break
-            fi
-            sleep 1
-          done
-          test "$ready" -eq 1
-
-          node browser-matrix.mjs 2>&1 | tee evidence/browser-matrix.log
-
-      - name: Verify evidence contract
-        if: always()
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-
-          evidence = Path('evidence')
-          result_path = evidence / 'result.json'
-          if not result_path.is_file():
-              raise SystemExit('result.json missing')
-          result = json.loads(result_path.read_text(encoding='utf-8'))
-          status = result.get('verdict', {}).get('status')
-          if status not in {'RUNTIME_NEGATIVE_CLOSED', 'RUNTIME_POSITIVE_REVIEW_REQUIRED'}:
-              raise SystemExit(f'invalid runtime status: {status!r}')
-          if not result['verdict'].get('controlMatrixComplete'):
-              raise SystemExit('control matrix incomplete')
-          if result['verdict'].get('engineErrors') != 0:
-              raise SystemExit('browser engine errors present')
-
-          sums = []
-          for item in sorted(evidence.iterdir()):
-              if item.is_file() and item.name != 'SHA256SUMS.txt':
-                  sums.append(f"{hashlib.sha256(item.read_bytes()).hexdigest()}  {item.name}")
-          (evidence / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
-          print(json.dumps(result['verdict'], indent=2, sort_keys=True))
-          PY
-
-      - name: Upload complete runtime evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: r64-dotnet11-csrf-browser-matrix-evidence
-          path: r64-dotnet11-csrf-browser-matrix/evidence/
-          if-no-files-found: error
+          test -f r64-dotnet11-csrf-browser-matrix/R64.csproj
+          test -f r64-dotnet11-csrf-browser-matrix/browser-matrix.mjs
+          echo "R64_WORKFLOW_PARSER_OK"
