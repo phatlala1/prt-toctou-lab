@@ -1,0 +1,6 @@
+@page "/collision"
+@inject IHttpContextAccessor HttpContextAccessor
+
+<CacheView VaryByUser="true" CacheKey="r59-collision" ExpiresAfter="@TimeSpan.FromMinutes(10)">
+    <div id="cached-user">secret-@HttpContextAccessor.HttpContext!.User.Identity!.Name</div>
+</CacheView>
