@@ -36,7 +36,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p evidence nginx-root/logs nginx-root/tmp nginx-root/conf
+          mkdir -p \
+            evidence \
+            nginx-root/logs \
+            nginx-root/conf \
+            nginx-root/tmp/client \
+            nginx-root/tmp/proxy \
+            nginx-root/tmp/fastcgi \
+            nginx-root/tmp/uwsgi \
+            nginx-root/tmp/scgi
           dotnet --info | tee evidence/dotnet-info.txt
           dotnet --list-runtimes | tee evidence/dotnet-runtimes.txt
           dotnet --list-sdks | tee evidence/dotnet-sdks.txt
@@ -53,6 +61,7 @@ jobs:
       - name: Write isolated nginx configuration
         shell: bash
         run: |
+          set -euo pipefail
           cat > nginx-root/conf/nginx.conf <<EOF
           worker_processes 1;
           pid $PWD/nginx-root/nginx.pid;
@@ -63,8 +72,7 @@ jobs:
           }
 
           http {
-              access_log off;
-              log_format r69 '$msec|$server_port|$request|$status|$request_length|te=$http_transfer_encoding|cl=$http_content_length';
+              log_format r69 '\$msec|\$server_port|\$request|\$status|\$request_length|te=\$http_transfer_encoding|cl=\$http_content_length';
               access_log $PWD/evidence/nginx-access.log r69;
               client_body_temp_path $PWD/nginx-root/tmp/client;
               proxy_temp_path $PWD/nginx-root/tmp/proxy;
@@ -84,7 +92,7 @@ jobs:
                   listen 127.0.0.1:5280;
                   location / {
                       proxy_http_version 1.1;
-                      proxy_set_header Host $host;
+                      proxy_set_header Host \$host;
                       proxy_set_header Connection "";
                       proxy_pass http://r69_kestrel;
                   }
@@ -95,7 +103,7 @@ jobs:
                   location / {
                       proxy_http_version 1.1;
                       proxy_request_buffering off;
-                      proxy_set_header Host $host;
+                      proxy_set_header Host \$host;
                       proxy_set_header Connection "";
                       proxy_pass http://r69_kestrel;
                   }
