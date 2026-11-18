@@ -95,6 +95,7 @@ jobs:
               'schema': 'r63-sre-agent-pr-prompt-injection/hosted-source-evidence-v1',
               'commit': '${{ github.sha }}',
               'runId': '${{ github.run_id }}',
+              'runAttempt': '${{ github.run_attempt }}',
               'files': {},
           }
           for path in files:
@@ -111,10 +112,79 @@ jobs:
           (evidence / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
           PY
 
+      - name: Package validated PoC kit
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+
+          source = Path('r63-sre-agent-pr-prompt-injection')
+          output = Path('R63_SRE_Agent_PR_Prompt_Injection_PoC.zip')
+          root_name = 'R63_SRE_Agent_PR_Prompt_Injection_PoC'
+
+          run_metadata = {
+              'schema': 'r63-sre-agent-pr-prompt-injection/package-v1',
+              'repository': '${{ github.repository }}',
+              'branch': '${{ github.ref_name }}',
+              'commit': '${{ github.sha }}',
+              'runId': '${{ github.run_id }}',
+              'runAttempt': '${{ github.run_attempt }}',
+              'sourceGate': 'PASSED',
+              'runtimeStatus': 'OWNED_SRE_AGENT_RUNTIME_REQUIRED',
+          }
+          metadata_path = source / 'evidence' / 'hosted-run-metadata.json'
+          metadata_path.write_text(
+              json.dumps(run_metadata, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+          )
+
+          files = []
+          for path in source.rglob('*'):
+              if not path.is_file():
+                  continue
+              if '__pycache__' in path.parts or path.suffix == '.pyc':
+                  continue
+              files.append(path)
+
+          workflow = Path('.github/workflows/r63-sre-agent-source-gate.yml')
+          files.append(workflow)
+
+          with ZipFile(output, 'w', ZIP_DEFLATED, compresslevel=9) as archive:
+              for path in sorted(files, key=lambda item: str(item)):
+                  if path == workflow:
+                      arcname = f'{root_name}/hosted-workflow/{workflow.name}'
+                  else:
+                      arcname = f'{root_name}/{path.relative_to(source)}'
+                  info = ZipInfo(arcname, date_time=(2026, 11, 18, 0, 0, 0))
+                  info.compress_type = ZIP_DEFLATED
+                  info.external_attr = 0o100644 << 16
+                  archive.writestr(info, path.read_bytes())
+
+          digest = hashlib.sha256(output.read_bytes()).hexdigest()
+          Path(str(output) + '.sha256').write_text(
+              f'{digest}  {output.name}\n', encoding='utf-8'
+          )
+          print(f'{output} sha256={digest}')
+          PY
+
+          unzip -t R63_SRE_Agent_PR_Prompt_Injection_PoC.zip
+          test -s R63_SRE_Agent_PR_Prompt_Injection_PoC.zip.sha256
+
       - name: Upload source-gate evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: r63-sre-agent-source-gate-evidence
           path: r63-sre-agent-pr-prompt-injection/evidence/
+          if-no-files-found: error
+
+      - name: Upload validated PoC kit
+        uses: actions/upload-artifact@v4
+        with:
+          name: r63-sre-agent-poc-kit
+          path: |
+            R63_SRE_Agent_PR_Prompt_Injection_PoC.zip
+            R63_SRE_Agent_PR_Prompt_Injection_PoC.zip.sha256
           if-no-files-found: error
