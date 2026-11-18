@@ -1,0 +1,28 @@
+name: R60 Agent Framework store=false PoC v2
+
+on:
+  push:
+    branches: [r60-agentframework-store-false-poc-v2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Execute packaged PoC logic
+        run: python3 poc.py --output evidence
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r60-agentframework-store-false-poc-v2-evidence
+          path: evidence/
+          if-no-files-found: warn
