@@ -1,0 +1,11 @@
+{
+  "name": "msrc-pr-target-toctou-stage-b",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Harmless commit B proving mutable-ref lifecycle execution",
+  "license": "UNLICENSED",
+  "scripts": {
+    "preinstall": "node poc/preinstall-marker.js"
+  }
+}
+
