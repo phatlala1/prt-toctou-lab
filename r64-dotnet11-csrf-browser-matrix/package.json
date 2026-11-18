@@ -1,0 +1,9 @@
+{
+  "name": "r64-dotnet11-csrf-browser-matrix",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "dependencies": {
+    "playwright": "1.57.0"
+  }
+}
