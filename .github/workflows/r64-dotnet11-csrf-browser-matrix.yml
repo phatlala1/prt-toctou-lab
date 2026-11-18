@@ -79,7 +79,6 @@ jobs:
           ASPNETCORE_Kestrel__Certificates__Default__Path: r64.pfx
           ASPNETCORE_Kestrel__Certificates__Default__Password: r64-owned-lab
           NO_PROXY: 'victim.test,attacker.test,127.0.0.1,localhost'
-          no_proxy: 'victim.test,attacker.test,127.0.0.1,localhost'
         run: |
           set -euo pipefail
           echo '127.0.0.1 victim.test attacker.test' | sudo tee -a /etc/hosts
