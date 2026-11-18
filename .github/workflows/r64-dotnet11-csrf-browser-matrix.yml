@@ -10,16 +10,157 @@ permissions:
   contents: read
 
 jobs:
-  parser-check:
+  browser-matrix:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+
     steps:
       - name: Check out laboratory
         uses: actions/checkout@v4
 
-      - name: Confirm workflow parser and branch contents
+      - name: Install stock .NET 11 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '11.0.x'
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: r64-dotnet11-csrf-browser-matrix/package-lock.json
+
+      - name: Record toolchain
         shell: bash
+        working-directory: r64-dotnet11-csrf-browser-matrix
         run: |
           set -euo pipefail
-          test -f r64-dotnet11-csrf-browser-matrix/R64.csproj
-          test -f r64-dotnet11-csrf-browser-matrix/browser-matrix.mjs
-          echo "R64_WORKFLOW_PARSER_OK"
+          mkdir -p evidence
+          dotnet --info | tee evidence/dotnet-info.txt
+          dotnet --list-runtimes | tee evidence/dotnet-runtimes.txt
+          dotnet --list-sdks | tee evidence/dotnet-sdks.txt
+          node --version | tee evidence/node-version.txt
+          npm --version | tee evidence/npm-version.txt
+          git rev-parse HEAD | tee evidence/source-commit.txt
+
+      - name: Install pinned Playwright browsers
+        shell: bash
+        working-directory: r64-dotnet11-csrf-browser-matrix
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npx playwright --version | tee evidence/playwright-version.txt
+          npx playwright install --with-deps chromium firefox webkit
+
+      - name: Generate owned loopback certificate
+        shell: bash
+        working-directory: r64-dotnet11-csrf-browser-matrix
+        run: |
+          set -euo pipefail
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
+            -keyout r64.key -out r64.crt \
+            -subj '/CN=victim.test' \
+            -addext 'subjectAltName=DNS:victim.test,DNS:attacker.test,IP:127.0.0.1'
+          openssl pkcs12 -export -out r64.pfx \
+            -inkey r64.key -in r64.crt -passout pass:r64-owned-lab
+          sha256sum r64.pfx > evidence/certificate-sha256.txt
+
+      - name: Build stock application
+        shell: bash
+        working-directory: r64-dotnet11-csrf-browser-matrix
+        run: |
+          set -euo pipefail
+          dotnet restore
+          dotnet build --configuration Release --no-restore 2>&1 | tee evidence/build.log
+
+      - name: Run real browser matrix
+        shell: bash
+        working-directory: r64-dotnet11-csrf-browser-matrix
+        env:
+          ASPNETCORE_URLS: 'https://0.0.0.0:5001;https://0.0.0.0:5002'
+          ASPNETCORE_Kestrel__Certificates__Default__Path: r64.pfx
+          ASPNETCORE_Kestrel__Certificates__Default__Password: r64-owned-lab
+          NO_PROXY: 'victim.test,attacker.test,127.0.0.1,localhost'
+          no_proxy: 'victim.test,attacker.test,127.0.0.1,localhost'
+        run: |
+          set -euo pipefail
+          echo '127.0.0.1 victim.test attacker.test' | sudo tee -a /etc/hosts
+          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy || true
+
+          dotnet run --configuration Release --no-build > evidence/server.log 2>&1 &
+          server_pid=$!
+          echo "$server_pid" > evidence/server.pid
+          cleanup() {
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for attempt in $(seq 1 60); do
+            if curl --noproxy '*' --silent --show-error --fail --insecure \
+              --resolve victim.test:5001:127.0.0.1 \
+              https://victim.test:5001/health > evidence/health.json; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != '1' ]]; then
+            cat evidence/server.log
+            exit 1
+          fi
+
+          set +e
+          node browser-matrix.mjs 2>&1 | tee evidence/browser-matrix.log
+          probe_status=${PIPESTATUS[0]}
+          set -e
+
+          cleanup
+          trap - EXIT
+          exit "$probe_status"
+
+      - name: Verify evidence contract
+        if: always()
+        shell: bash
+        working-directory: r64-dotnet11-csrf-browser-matrix
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          evidence = Path('evidence')
+          result_path = evidence / 'result.json'
+          if not result_path.is_file():
+              raise SystemExit('result.json missing')
+
+          result = json.loads(result_path.read_text(encoding='utf-8'))
+          verdict = result.get('verdict', {})
+          status = verdict.get('status')
+          allowed = {'RUNTIME_NEGATIVE_CLOSED', 'RUNTIME_POSITIVE_REVIEW_REQUIRED'}
+          if status not in allowed:
+              raise SystemExit(f'invalid runtime status: {status!r}')
+          if not verdict.get('controlMatrixComplete'):
+              raise SystemExit('control matrix incomplete')
+          if verdict.get('engineErrors') != 0:
+              raise SystemExit('browser engine errors present')
+
+          sums = []
+          for item in sorted(evidence.iterdir()):
+              if item.is_file() and item.name != 'SHA256SUMS.txt':
+                  digest = hashlib.sha256(item.read_bytes()).hexdigest()
+                  sums.append(f'{digest}  {item.name}')
+          (evidence / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+          print(json.dumps(verdict, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload complete runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r64-dotnet11-csrf-browser-matrix-evidence
+          path: r64-dotnet11-csrf-browser-matrix/evidence/
+          if-no-files-found: error
+          retention-days: 30
