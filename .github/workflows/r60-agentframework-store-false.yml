@@ -2,8 +2,7 @@ name: R60 Agent Framework store=false hosted PoC
 
 on:
   push:
-    branches:
-      - r60-agentframework-store-false
+    branches: [r60-agentframework-store-false]
   workflow_dispatch:
 
 permissions:
@@ -42,51 +41,32 @@ jobs:
           }
           trap cleanup EXIT
 
-          ready=0
           for _ in $(seq 1 90); do
-            if curl -fsS http://127.0.0.1:5090/ready > ready.json; then
-              ready=1
-              break
-            fi
+            curl -fsS http://127.0.0.1:5090/ready > ready.json && break
             sleep 1
           done
-          if [[ "$ready" != "1" ]]; then
-            cat server.log
-            exit 1
-          fi
+          test -s ready.json || { cat server.log; exit 1; }
 
-          cat > request-store-false.json <<'JSON'
-          {
-            "model": "assistant",
-            "input": "R60_PRIVATE_INPUT_STORE_FALSE",
-            "store": false,
-            "stream": false
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          common = {
+              "model": "synthetic-model",
+              "metadata": {"entity_id": "assistant"},
+              "stream": False,
           }
-          JSON
+          false_request = dict(common, input="R60_PRIVATE_INPUT_STORE_FALSE", store=False)
+          true_request = dict(common, input="R60_CONTROL_INPUT_STORE_TRUE", store=True)
+          Path("request-store-false.json").write_text(json.dumps(false_request) + "\n")
+          Path("request-store-true.json").write_text(json.dumps(true_request) + "\n")
+          PY
 
-          cat > request-store-true.json <<'JSON'
-          {
-            "model": "assistant",
-            "input": "R60_CONTROL_INPUT_STORE_TRUE",
-            "store": true,
-            "stream": false
-          }
-          JSON
-
-          false_post_status=$(curl -sS \
-            -o response-store-false.json \
-            -D response-store-false.headers \
-            -w '%{http_code}' \
-            -H 'Content-Type: application/json' \
-            --data-binary @request-store-false.json \
+          false_post_status=$(curl -sS -o response-store-false.json -D response-store-false.headers -w '%{http_code}' \
+            -H 'Content-Type: application/json' --data-binary @request-store-false.json \
             http://127.0.0.1:5090/v1/responses)
-
-          true_post_status=$(curl -sS \
-            -o response-store-true.json \
-            -D response-store-true.headers \
-            -w '%{http_code}' \
-            -H 'Content-Type: application/json' \
-            --data-binary @request-store-true.json \
+          true_post_status=$(curl -sS -o response-store-true.json -D response-store-true.headers -w '%{http_code}' \
+            -H 'Content-Type: application/json' --data-binary @request-store-true.json \
             http://127.0.0.1:5090/v1/responses)
 
           FALSE_POST_STATUS="$false_post_status" TRUE_POST_STATUS="$true_post_status" python3 - <<'PY'
@@ -94,10 +74,10 @@ jobs:
           import os
           from pathlib import Path
 
-          if os.environ["FALSE_POST_STATUS"] != "200":
-              raise SystemExit(f"store=false POST failed: {os.environ['FALSE_POST_STATUS']}\n{Path('response-store-false.json').read_text(errors='replace')}")
-          if os.environ["TRUE_POST_STATUS"] != "200":
-              raise SystemExit(f"store=true POST failed: {os.environ['TRUE_POST_STATUS']}\n{Path('response-store-true.json').read_text(errors='replace')}")
+          for name, status in [("store=false", os.environ["FALSE_POST_STATUS"]), ("store=true", os.environ["TRUE_POST_STATUS"])]:
+              if status != "200":
+                  body = Path(f"response-{name}.json").read_text(errors="replace") if Path(f"response-{name}.json").exists() else ""
+                  raise SystemExit(f"{name} POST failed: {status}: {body}")
 
           for source, target in [
               ("response-store-false.json", "response-store-false.id"),
@@ -113,59 +93,36 @@ jobs:
           false_id=$(tr -d '\r\n' < response-store-false.id)
           true_id=$(tr -d '\r\n' < response-store-true.id)
 
-          false_get_status=$(curl -sS \
-            -o get-store-false.json \
-            -D get-store-false.headers \
-            -w '%{http_code}' \
+          false_get_status=$(curl -sS -o get-store-false.json -D get-store-false.headers -w '%{http_code}' \
             "http://127.0.0.1:5090/v1/responses/${false_id}")
-
-          true_get_status=$(curl -sS \
-            -o get-store-true.json \
-            -D get-store-true.headers \
-            -w '%{http_code}' \
+          true_get_status=$(curl -sS -o get-store-true.json -D get-store-true.headers -w '%{http_code}' \
             "http://127.0.0.1:5090/v1/responses/${true_id}")
-
-          false_input_status=$(curl -sS \
-            -o input-items-store-false.json \
-            -D input-items-store-false.headers \
-            -w '%{http_code}' \
+          false_input_status=$(curl -sS -o input-items-store-false.json -D input-items-store-false.headers -w '%{http_code}' \
             "http://127.0.0.1:5090/v1/responses/${false_id}/input_items")
-
-          true_input_status=$(curl -sS \
-            -o input-items-store-true.json \
-            -D input-items-store-true.headers \
-            -w '%{http_code}' \
+          true_input_status=$(curl -sS -o input-items-store-true.json -D input-items-store-true.headers -w '%{http_code}' \
             "http://127.0.0.1:5090/v1/responses/${true_id}/input_items")
 
-          FALSE_POST_STATUS="$false_post_status" \
-          TRUE_POST_STATUS="$true_post_status" \
-          FALSE_GET_STATUS="$false_get_status" \
-          TRUE_GET_STATUS="$true_get_status" \
-          FALSE_INPUT_STATUS="$false_input_status" \
-          TRUE_INPUT_STATUS="$true_input_status" \
+          FALSE_POST_STATUS="$false_post_status" TRUE_POST_STATUS="$true_post_status" \
+          FALSE_GET_STATUS="$false_get_status" TRUE_GET_STATUS="$true_get_status" \
+          FALSE_INPUT_STATUS="$false_input_status" TRUE_INPUT_STATUS="$true_input_status" \
           python3 - <<'PY'
           import json
           import os
           from pathlib import Path
 
-          def load_json(path):
+          def load(path):
               try:
                   return json.loads(Path(path).read_text())
               except Exception:
                   return None
 
-          false_post = load_json("response-store-false.json")
-          true_post = load_json("response-store-true.json")
-          false_get = load_json("get-store-false.json")
-          true_get = load_json("get-store-true.json")
-          false_items = load_json("input-items-store-false.json")
-          true_items = load_json("input-items-store-true.json")
-
+          false_post = load("response-store-false.json")
+          true_post = load("response-store-true.json")
           result = {
               "schema": "r60-agentframework-store-false/v1",
               "publishedPackages": {
                   "Microsoft.Agents.AI.Hosting": "1.28.0-preview.261106.1",
-                  "Microsoft.Agents.AI.Hosting.OpenAI": "1.28.0-alpha.261106.1",
+                  "Microsoft.Agents.AI.Hosting.OpenAI": "1.28.0-alpha.261106.1"
               },
               "storeFalse": {
                   "postStatus": int(os.environ["FALSE_POST_STATUS"]),
@@ -173,8 +130,8 @@ jobs:
                   "responseStoreField": false_post.get("store") if isinstance(false_post, dict) else None,
                   "getStatus": int(os.environ["FALSE_GET_STATUS"]),
                   "inputItemsStatus": int(os.environ["FALSE_INPUT_STATUS"]),
-                  "getBody": false_get,
-                  "inputItemsBody": false_items,
+                  "getBody": load("get-store-false.json"),
+                  "inputItemsBody": load("input-items-store-false.json")
               },
               "storeTrueControl": {
                   "postStatus": int(os.environ["TRUE_POST_STATUS"]),
@@ -182,27 +139,23 @@ jobs:
                   "responseStoreField": true_post.get("store") if isinstance(true_post, dict) else None,
                   "getStatus": int(os.environ["TRUE_GET_STATUS"]),
                   "inputItemsStatus": int(os.environ["TRUE_INPUT_STATUS"]),
-                  "getBody": true_get,
-                  "inputItemsBody": true_items,
-              },
+                  "getBody": load("get-store-true.json"),
+                  "inputItemsBody": load("input-items-store-true.json")
+              }
           }
           result["observations"] = {
               "storeFalseResponseRetrievable": result["storeFalse"]["getStatus"] == 200,
               "storeFalseInputItemsRetrievable": result["storeFalse"]["inputItemsStatus"] == 200,
               "storeTrueControlRetrievable": result["storeTrueControl"]["getStatus"] == 200,
-              "storeTrueControlInputItemsRetrievable": result["storeTrueControl"]["inputItemsStatus"] == 200,
+              "storeTrueControlInputItemsRetrievable": result["storeTrueControl"]["inputItemsStatus"] == 200
           }
-
           Path("result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
           print(json.dumps(result, indent=2, sort_keys=True))
-
-          assert result["storeFalse"]["postStatus"] == 200
           assert result["storeTrueControl"]["postStatus"] == 200
-          assert result["observations"]["storeTrueControlRetrievable"], "store=true control was not retrievable"
-          assert result["observations"]["storeTrueControlInputItemsRetrievable"], "store=true input-items control was not retrievable"
+          assert result["observations"]["storeTrueControlRetrievable"]
+          assert result["observations"]["storeTrueControlInputItemsRetrievable"]
           PY
 
-          # Best-effort owned-lab cleanup after evidence has been recorded.
           curl -sS -X DELETE "http://127.0.0.1:5090/v1/responses/${false_id}" -o delete-store-false.json -w '%{http_code}\n' > delete-store-false.status || true
           curl -sS -X DELETE "http://127.0.0.1:5090/v1/responses/${true_id}" -o delete-store-true.json -w '%{http_code}\n' > delete-store-true.status || true
 
@@ -218,23 +171,13 @@ jobs:
             ready.json
             request-store-false.json
             request-store-true.json
-            response-store-false.json
-            response-store-false.headers
-            response-store-false.id
-            response-store-true.json
-            response-store-true.headers
-            response-store-true.id
-            get-store-false.json
-            get-store-false.headers
-            get-store-true.json
-            get-store-true.headers
-            input-items-store-false.json
-            input-items-store-false.headers
-            input-items-store-true.json
-            input-items-store-true.headers
-            delete-store-false.json
-            delete-store-false.status
-            delete-store-true.json
-            delete-store-true.status
+            response-store-false.*
+            response-store-true.*
+            get-store-false.*
+            get-store-true.*
+            input-items-store-false.*
+            input-items-store-true.*
+            delete-store-false.*
+            delete-store-true.*
             result.json
           if-no-files-found: warn
