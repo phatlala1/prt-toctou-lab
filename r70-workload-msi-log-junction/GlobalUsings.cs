@@ -1,0 +1,12 @@
+global using System.Diagnostics;
+global using System.IO.Hashing;
+global using System.IO.Pipes;
+global using System.Net.NetworkInformation;
+global using System.Reflection;
+global using System.Runtime.InteropServices;
+global using System.Security.AccessControl;
+global using System.Security.Cryptography;
+global using System.Security.Principal;
+global using System.Text;
+global using System.Text.Json;
+global using Microsoft.Win32.SafeHandles;
