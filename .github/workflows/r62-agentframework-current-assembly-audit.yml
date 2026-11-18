@@ -1,0 +1,104 @@
+name: R62 Agent Framework current assembly audit
+
+on:
+  push:
+    branches: [r62-agentframework-current-assembly-audit]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 11.0.x
+
+      - name: Restore exact published packages
+        run: |
+          set -euo pipefail
+          dotnet --info | tee dotnet-info.txt
+          dotnet restore r60-agentframework-store-false/R60AgentFramework.csproj
+          dotnet list r60-agentframework-store-false/R60AgentFramework.csproj package --include-transitive | tee package-graph.txt
+          find "$HOME/.nuget/packages" -type f \
+            \( -iname 'Microsoft.Agents.AI.Hosting*.dll' -o -iname 'A2A*.dll' \) \
+            | sort | tee assembly-paths.txt
+
+      - name: Install pinned ILSpy CLI
+        run: |
+          set -euo pipefail
+          dotnet tool install --global ilspycmd --version 11.2.0.10050
+          "$HOME/.dotnet/tools/ilspycmd" --version | tee ilspy-version.txt
+
+      - name: Decompile security-relevant classes
+        run: |
+          set -euo pipefail
+          mkdir -p type-lists decompiled
+
+          mapfile -t assemblies < <(find "$HOME/.nuget/packages" -type f \
+            \( -iname 'Microsoft.Agents.AI.Hosting.dll' \
+               -o -iname 'Microsoft.Agents.AI.Hosting.AspNetCore.dll' \
+               -o -iname 'Microsoft.Agents.AI.Hosting.OpenAI.dll' \
+               -o -iname 'Microsoft.Agents.AI.Hosting.A2A.dll' \
+               -o -iname 'Microsoft.Agents.AI.Hosting.A2A.AspNetCore.dll' \) \
+            | grep -E '/1\.28\.0-' | sort -u)
+
+          printf '%s\n' "${assemblies[@]}" | tee selected-assemblies.txt
+          test "${#assemblies[@]}" -ge 4
+
+          for dll in "${assemblies[@]}"; do
+            assembly=$(basename "$dll" .dll)
+            list="type-lists/${assembly}.txt"
+            "$HOME/.dotnet/tools/ilspycmd" -l c "$dll" > "$list"
+
+            awk '$1 == "Class" { print $2 }' "$list" \
+              | grep -E 'ClaimsIdentityAgentIsolationKeyProvider|AgentIsolationKeyProvider|IsolationKeyScoped|InMemoryResponsesService|ResponsesService|ConversationStorage|ConversationIndex|TaskStore|A2AServer|A2AAgentHandler|TaskManager|EndpointRouteBuilderExtensions' \
+              | sort -u \
+              | head -80 \
+              > "type-lists/${assembly}.selected.txt" || true
+
+            while IFS= read -r type; do
+              test -n "$type" || continue
+              safe=$(printf '%s' "$type" | tr '.+`/' '____')
+              "$HOME/.dotnet/tools/ilspycmd" -t "$type" "$dll" \
+                > "decompiled/${assembly}__${safe}.cs" || true
+            done < "type-lists/${assembly}.selected.txt"
+          done
+
+          echo '=== SELECTED TYPES ==='
+          for f in type-lists/*.selected.txt; do
+            echo "--- $f"
+            cat "$f"
+          done
+
+          echo '=== KEY / AUTHORITY OPERATIONS ==='
+          grep -R -n -E \
+            'GetIsolationKey|WithPartition|isolation|StringComparer|ConcurrentDictionary|MemoryCache|TryGetValue|Set\(|Get\(|Save|Delete|contextId|taskId|conversationId|responseId' \
+            decompiled | head -1200 | tee security-operation-index.txt || true
+
+          echo '=== DECOMPILED SELECTED SOURCES ==='
+          for f in decompiled/*.cs; do
+            echo "===== $f ====="
+            sed -n '1,320p' "$f"
+          done
+
+      - name: Upload audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r62-agentframework-current-assembly-audit
+          path: |
+            dotnet-info.txt
+            package-graph.txt
+            assembly-paths.txt
+            selected-assemblies.txt
+            ilspy-version.txt
+            type-lists/
+            decompiled/
+            security-operation-index.txt
+          if-no-files-found: warn
