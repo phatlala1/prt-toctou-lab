@@ -1,4 +1,5 @@
 using System.Security.Claims;
+using R59CacheView;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddRazorComponents();
