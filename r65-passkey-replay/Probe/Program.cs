@@ -401,7 +401,7 @@ static string Base64UrlEncode(ReadOnlySpan<byte> value)
         .Replace('+', '-')
         .Replace('/', '_');
 
-static string Sha256Hex(ReadOnlySpan<byte> value)
+static string TopLevelSha256Hex(ReadOnlySpan<byte> value)
     => Convert.ToHexString(SHA256.HashData(value)).ToLowerInvariant();
 
 static bool FixedStringEquals(string left, string right)
