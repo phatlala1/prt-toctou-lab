@@ -1,0 +1,190 @@
+name: R69 Kestrel proxy request-boundary differential
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "r69-kestrel-smuggling/**"
+      - ".github/workflows/r69-kestrel-smuggling.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out laboratory
+        uses: actions/checkout@v4
+
+      - name: Install stock .NET 11 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "11.0.x"
+
+      - name: Install stock Ubuntu nginx
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nginx
+
+      - name: Capture runtime identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence nginx-root/logs nginx-root/tmp nginx-root/conf
+          dotnet --info | tee evidence/dotnet-info.txt
+          dotnet --list-runtimes | tee evidence/dotnet-runtimes.txt
+          dotnet --list-sdks | tee evidence/dotnet-sdks.txt
+          nginx -V > evidence/nginx-version.txt 2>&1
+          uname -a | tee evidence/runner-uname.txt
+          git rev-parse HEAD | tee evidence/source-commit.txt
+
+      - name: Build Kestrel server
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet build r69-kestrel-smuggling/Server/Server.csproj -c Release 2>&1 | tee evidence/build.log
+
+      - name: Write isolated nginx configuration
+        shell: bash
+        run: |
+          cat > nginx-root/conf/nginx.conf <<EOF
+          worker_processes 1;
+          pid $PWD/nginx-root/nginx.pid;
+          error_log $PWD/evidence/nginx-error.log info;
+
+          events {
+              worker_connections 256;
+          }
+
+          http {
+              access_log off;
+              log_format r69 '$msec|$server_port|$request|$status|$request_length|te=$http_transfer_encoding|cl=$http_content_length';
+              access_log $PWD/evidence/nginx-access.log r69;
+              client_body_temp_path $PWD/nginx-root/tmp/client;
+              proxy_temp_path $PWD/nginx-root/tmp/proxy;
+              fastcgi_temp_path $PWD/nginx-root/tmp/fastcgi;
+              uwsgi_temp_path $PWD/nginx-root/tmp/uwsgi;
+              scgi_temp_path $PWD/nginx-root/tmp/scgi;
+              client_header_timeout 5s;
+              client_body_timeout 5s;
+              keepalive_timeout 15s;
+
+              upstream r69_kestrel {
+                  server 127.0.0.1:5290;
+                  keepalive 1;
+              }
+
+              server {
+                  listen 127.0.0.1:5280;
+                  location / {
+                      proxy_http_version 1.1;
+                      proxy_set_header Host $host;
+                      proxy_set_header Connection "";
+                      proxy_pass http://r69_kestrel;
+                  }
+              }
+
+              server {
+                  listen 127.0.0.1:5281;
+                  location / {
+                      proxy_http_version 1.1;
+                      proxy_request_buffering off;
+                      proxy_set_header Host $host;
+                      proxy_set_header Connection "";
+                      proxy_pass http://r69_kestrel;
+                  }
+              }
+          }
+          EOF
+          nginx -t -p "$PWD/nginx-root" -c conf/nginx.conf 2>&1 | tee evidence/nginx-config-test.txt
+          cp nginx-root/conf/nginx.conf evidence/nginx.conf
+
+      - name: Run real proxy and Kestrel differential
+        id: runtime
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          export R69_BACKEND_LOG="$PWD/evidence/backend.jsonl"
+          : > "$R69_BACKEND_LOG"
+          : > evidence/nginx-access.log
+
+          dotnet run \
+            --project r69-kestrel-smuggling/Server/Server.csproj \
+            -c Release \
+            --no-build \
+            --urls http://127.0.0.1:5290 \
+            > evidence/kestrel-console.log 2>&1 &
+          kestrel_pid=$!
+
+          nginx -p "$PWD/nginx-root" -c conf/nginx.conf -g 'daemon off;' \
+            > evidence/nginx-console.log 2>&1 &
+          nginx_pid=$!
+
+          cleanup() {
+            kill "$nginx_pid" "$kestrel_pid" 2>/dev/null || true
+            wait "$nginx_pid" 2>/dev/null || true
+            wait "$kestrel_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for port in 5290 5280 5281; do
+            for attempt in $(seq 1 60); do
+              if curl -fsS --max-time 1 "http://127.0.0.1:${port}/r69/health" >/dev/null; then
+                break
+              fi
+              sleep 0.5
+            done
+            curl -fsS --max-time 2 "http://127.0.0.1:${port}/r69/health" >/dev/null
+          done
+
+          set +e
+          python3 r69-kestrel-smuggling/probe.py \
+            --backend-log "$R69_BACKEND_LOG" \
+            --proxy-log "$PWD/evidence/nginx-access.log" \
+            --out "$PWD/evidence/results.json" \
+            2>&1 | tee evidence/probe.log
+          probe_status=$?
+          set -e
+
+          cleanup
+          trap - EXIT
+          exit $probe_status
+
+      - name: Hash evidence
+        if: always()
+        shell: bash
+        run: |
+          find evidence -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            > evidence/SHA256SUMS.txt || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r69-kestrel-smuggling-evidence
+          path: evidence
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Surface runtime verdict
+        if: always()
+        shell: bash
+        run: |
+          if [[ ! -f evidence/results.json ]]; then
+            echo "R69 inconclusive: runtime evidence was not produced."
+            exit 1
+          fi
+          verdict="$(python3 -c 'import json; print(json.load(open("evidence/results.json"))["verdict"])')"
+          echo "R69 verdict: $verdict"
+          if [[ "$verdict" == POSITIVE* || "$verdict" == INCONCLUSIVE* ]]; then
+            exit 1
+          fi
