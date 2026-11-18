@@ -54,6 +54,15 @@ jobs:
           Get-FileHash -Algorithm SHA256 $dotnet, $rzc, $tasks | Format-Table -AutoSize | Out-File evidence/product-sha256.txt
           git rev-parse HEAD | Out-File evidence/source-commit.txt
 
+      - name: Apply deterministic readiness repair
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python r71-razor-server-cross-integrity/fix-readiness.py 2>&1 | Tee-Object evidence/source-repair.log
+          Copy-Item r71-razor-server-cross-integrity/Program.cs evidence/Program.patched.txt
+          Get-FileHash -Algorithm SHA256 r71-razor-server-cross-integrity/Program.cs, r71-razor-server-cross-integrity/fix-readiness.py |
+            Format-Table -AutoSize | Out-File evidence/source-sha256.txt
+
       - name: Build harness and extension
         shell: pwsh
         run: |
