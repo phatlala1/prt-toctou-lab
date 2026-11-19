@@ -60,7 +60,7 @@ jobs:
           git rev-parse HEAD | tee evidence/source-commit.txt
           printf '%s\n' '${{ matrix.os }}' | tee evidence/runner-os.txt
           printf '%s\n' '${{ matrix.major }}' | tee evidence/target-major.txt
-          cp r77-sslstream-mtls-policy-resume/Program.cs evidence/Program.cs.txt
+          cp r77-sslstream-mtls-policy-resume/ProgramV2.cs evidence/ProgramV2.cs.txt
           cp r77-sslstream-mtls-policy-resume/R77.csproj evidence/R77.csproj.txt
 
       - name: Restore and build
@@ -100,7 +100,6 @@ jobs:
           python - <<'PY' 2>&1 | tee evidence/verifier.log
           import json
           import pathlib
-          import sys
 
           path = pathlib.Path('evidence/result.json')
           if not path.exists():
@@ -109,39 +108,53 @@ jobs:
 
           data = json.loads(path.read_text(encoding='utf-8'))
           status = data.get('status')
-          protocols = [p for p in data.get('protocols', []) if p.get('supported')]
-          if not protocols:
-              print('INVALID_RUNTIME: no supported protocol result')
+          protocols = data.get('protocols', [])
+          valid = [p for p in protocols if p.get('status') in {
+              'RUNTIME_POSITIVE_REVIEW_REQUIRED',
+              'RUNTIME_NEGATIVE_CLOSED',
+          }]
+          if not valid:
+              print('INVALID_RUNTIME: no controlled protocol matrix', data.get('invalidReason'))
               raise SystemExit(2)
 
-          for protocol in protocols:
+          for protocol in valid:
               trials = protocol.get('trials', [])
               if len(trials) != 3:
                   print('INVALID_RUNTIME: incomplete trials', protocol.get('protocol'))
                   raise SystemExit(2)
               for trial in trials:
                   if trial.get('invalidReason') is not None:
-                      print('INVALID_RUNTIME: trial invalid', protocol.get('protocol'), trial.get('trialNumber'), trial.get('invalidReason'))
+                      print('INVALID_RUNTIME: invalid trial', protocol.get('protocol'), trial.get('trialNumber'))
                       raise SystemExit(2)
-                  if not trial.get('controlsPassed'):
-                      print('INVALID_RUNTIME: control failure', protocol.get('protocol'), trial.get('trialNumber'))
+                  if not trial.get('resumeBaselineProved') or not trial.get('controlsPassed'):
+                      print('INVALID_RUNTIME: baseline/control failure', protocol.get('protocol'), trial.get('trialNumber'))
                       raise SystemExit(2)
 
+          positives = [
+              (p.get('protocol'), t.get('trialNumber'))
+              for p in valid
+              for t in p.get('trials', [])
+              if t.get('candidatePositive')
+          ]
+
           if status == 'RUNTIME_POSITIVE_REVIEW_REQUIRED':
-              positive = []
-              for protocol in protocols:
-                  for trial in protocol.get('trials', []):
-                      if trial.get('candidatePositive'):
-                          positive.append((protocol.get('protocol'), trial.get('trialNumber')))
-              if not positive:
-                  print('INVALID_RUNTIME: positive status without positive trials')
+              positive_protocols = [p for p in valid if p.get('status') == status]
+              if not positives or not positive_protocols:
+                  print('INVALID_RUNTIME: positive status without a complete positive protocol')
                   raise SystemExit(2)
-              print('RUNTIME_POSITIVE_REVIEW_REQUIRED', positive)
+              for protocol in positive_protocols:
+                  if not all(t.get('candidatePositive') for t in protocol.get('trials', [])):
+                      print('INVALID_RUNTIME: partial positive protocol', protocol.get('protocol'))
+                      raise SystemExit(2)
+              print('RUNTIME_POSITIVE_REVIEW_REQUIRED', positives)
               raise SystemExit(10)
 
           if status == 'RUNTIME_NEGATIVE_CLOSED':
-              if any(t.get('candidatePositive') for p in protocols for t in p.get('trials', [])):
-                  print('INVALID_RUNTIME: negative status contains a positive trial')
+              if positives:
+                  print('INVALID_RUNTIME: negative status contains positive trials', positives)
+                  raise SystemExit(2)
+              if not any(p.get('status') == 'RUNTIME_NEGATIVE_CLOSED' for p in valid):
+                  print('INVALID_RUNTIME: no negative protocol')
                   raise SystemExit(2)
               print('RUNTIME_NEGATIVE_CLOSED')
               raise SystemExit(0)
@@ -163,7 +176,7 @@ jobs:
             | xargs -0 sha256sum \
             | sed 's#  evidence/#  #' \
             > evidence/SHA256SUMS.txt
-          sha256sum -c evidence/SHA256SUMS.txt --ignore-missing
+          (cd evidence && sha256sum -c SHA256SUMS.txt)
 
       - name: Upload complete evidence
         if: always()
