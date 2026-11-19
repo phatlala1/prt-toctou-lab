@@ -1,9 +1,6 @@
 name: R71 Razor server cross integrity
 
 on:
-  push:
-    branches:
-      - r71-razor-server-cross-integrity
   workflow_dispatch:
 
 permissions:
@@ -18,137 +15,9 @@ jobs:
       - name: Check out laboratory
         uses: actions/checkout@v4
 
-      - name: Install stock .NET 11 SDK
-        uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: '11.0.100'
-
-      - name: Record product paths and host identity
+      - name: Closed candidate notice
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force evidence | Out-Null
-          dotnet --info 2>&1 | Tee-Object evidence/dotnet-info.txt
-          dotnet --list-sdks 2>&1 | Tee-Object evidence/dotnet-sdks.txt
-          whoami /all 2>&1 | Tee-Object evidence/whoami.txt
-
-          $dotnet = (Get-Command dotnet).Source
-          $sdkRoot = Join-Path (Split-Path $dotnet -Parent) 'sdk/11.0.100'
-          $razorRoot = Join-Path $sdkRoot 'Sdks/Microsoft.NET.Sdk.Razor'
-          $rzc = Join-Path $razorRoot 'tools/rzc.dll'
-          $tasks = Get-ChildItem (Join-Path $razorRoot 'tasks') -Recurse -Filter Microsoft.NET.Sdk.Razor.Tasks.dll |
-            Sort-Object @{Expression={ if ($_.FullName -match 'net11\.0') { 0 } else { 1 } }}, FullName |
-            Select-Object -First 1 -ExpandProperty FullName
-
-          foreach ($path in @($dotnet, $sdkRoot, $razorRoot, $rzc, $tasks)) {
-            if (-not $path -or -not (Test-Path $path)) { throw "Required stock product path missing: $path" }
-          }
-
-          @{
-            dotnet = $dotnet
-            sdkRoot = $sdkRoot
-            razorRoot = $razorRoot
-            rzc = $rzc
-            tasks = $tasks
-          } | ConvertTo-Json | Out-File evidence/product-paths.json -Encoding utf8
-          Get-FileHash -Algorithm SHA256 $dotnet, $rzc, $tasks | Format-Table -AutoSize | Out-File evidence/product-sha256.txt
-          git rev-parse HEAD | Out-File evidence/source-commit.txt
-
-      - name: Apply deterministic runtime instrumentation
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python r71-razor-server-cross-integrity/fix-readiness.py 2>&1 | Tee-Object evidence/source-repair.log
-          python r71-razor-server-cross-integrity/instrument-trial.py 2>&1 | Tee-Object evidence/instrument-trial.log
-          python r71-razor-server-cross-integrity/instrument-client.py 2>&1 | Tee-Object evidence/instrument-client.log
-          python r71-razor-server-cross-integrity/instrument-task.py 2>&1 | Tee-Object evidence/instrument-task.log
-          python r71-razor-server-cross-integrity/instrument-launch.py 2>&1 | Tee-Object evidence/instrument-launch.log
-          python r71-razor-server-cross-integrity/instrument-apphost.py 2>&1 | Tee-Object evidence/instrument-apphost.log
-          python r71-razor-server-cross-integrity/instrument-resume.py 2>&1 | Tee-Object evidence/instrument-resume.log
-          python r71-razor-server-cross-integrity/instrument-lua-token.py 2>&1 | Tee-Object evidence/instrument-lua-token.log
-          Copy-Item r71-razor-server-cross-integrity/Program.cs evidence/Program.patched.txt
-          Get-FileHash -Algorithm SHA256 `
-            r71-razor-server-cross-integrity/Program.cs, `
-            r71-razor-server-cross-integrity/fix-readiness.py, `
-            r71-razor-server-cross-integrity/instrument-trial.py, `
-            r71-razor-server-cross-integrity/instrument-client.py, `
-            r71-razor-server-cross-integrity/instrument-task.py, `
-            r71-razor-server-cross-integrity/instrument-launch.py, `
-            r71-razor-server-cross-integrity/instrument-apphost.py, `
-            r71-razor-server-cross-integrity/instrument-resume.py, `
-            r71-razor-server-cross-integrity/instrument-lua-token.py |
-            Format-Table -AutoSize | Out-File evidence/source-sha256.txt
-
-      - name: Build harness and extension
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          dotnet build r71-razor-server-cross-integrity/R71Extension/R71Extension.csproj -c Release 2>&1 | Tee-Object evidence/build-extension.log
-          dotnet build r71-razor-server-cross-integrity/R71.csproj -c Release 2>&1 | Tee-Object evidence/build-harness.log
-
-      - name: Run LUA-token diagnostic
-        id: runtime
-        continue-on-error: true
-        shell: pwsh
-        env:
-          DOTNET_NOLOGO: '1'
-          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
-          DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $paths = Get-Content evidence/product-paths.json -Raw | ConvertFrom-Json
-          $harness = (Resolve-Path 'r71-razor-server-cross-integrity/bin/Release/net11.0-windows/R71.dll').Path
-          $extension = (Resolve-Path 'r71-razor-server-cross-integrity/R71Extension/bin/Release/net11.0-windows/R71Extension.dll').Path
-          $invokeProject = (Resolve-Path 'r71-razor-server-cross-integrity/InvokeRazor.proj').Path
-          $runtimeEvidence = Join-Path $PWD 'evidence/runtime'
-
-          & $paths.dotnet $harness orchestrate $runtimeEvidence $paths.dotnet $paths.rzc $paths.tasks $extension $invokeProject 2>&1 |
-            Tee-Object evidence/runtime-console.log
-          $code = $LASTEXITCODE
-          "runtime_exit_code=$code" | Out-File evidence/runtime-exit.txt
-          exit $code
-
-      - name: Hash complete evidence
-        if: always()
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          Get-ChildItem evidence -File -Recurse |
-            Where-Object Name -ne 'SHA256SUMS.txt' |
-            Sort-Object FullName |
-            ForEach-Object {
-              $relative = [IO.Path]::GetRelativePath((Resolve-Path evidence), $_.FullName)
-              $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
-              "$hash  $relative"
-            } | Out-File evidence/SHA256SUMS.txt -Encoding utf8
-
-      - name: Upload complete runtime evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: r71-razor-server-cross-integrity-evidence
-          path: evidence/
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Surface runtime verdict
-        if: always()
-        shell: pwsh
-        run: |
-          $resultPath = 'evidence/runtime/result.json'
-          if (-not (Test-Path $resultPath)) {
-            Write-Error 'R71 invalid: result.json was not produced.'
-            exit 1
-          }
-          $result = Get-Content $resultPath -Raw | ConvertFrom-Json
-          $status = $result.verdict.status
-          $result.verdict | ConvertTo-Json -Depth 10
-          if ($status -eq 'RUNTIME_POSITIVE_REVIEW_REQUIRED') {
-            Write-Error 'R71 runtime positive: exact duplicate and report review required.'
-            exit 1
-          }
-          if ($status -ne 'RUNTIME_NEGATIVE_OR_INVALID') {
-            Write-Error "Unexpected R71 status: $status"
-            exit 1
-          }
+          Write-Host 'R71 is closed: same-desktop UAC elevation is not an MSRC serviced security boundary.'
+          Write-Host 'See r71-razor-server-cross-integrity/CLOSED_R71_UAC_NON_BOUNDARY.md.'
           exit 0
