@@ -1,0 +1,196 @@
+name: R77 SslStream mTLS policy resumption
+
+on:
+  push:
+    branches: [r77-sslstream-mtls-policy-resume]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: ${{ matrix.os }} / .NET ${{ matrix.major }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            major: 10
+            sdk: 10.0.404
+          - os: ubuntu-latest
+            major: 11
+            sdk: 11.0.100
+          - os: windows-latest
+            major: 10
+            sdk: 10.0.404
+          - os: windows-latest
+            major: 11
+            sdk: 11.0.100
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      DOTNET_SYSTEM_NET_SECURITY_TLSCACHESIZE: "500"
+
+    steps:
+      - name: Check out laboratory
+        uses: actions/checkout@v4
+
+      - name: Install stock supported .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Prepare exact target framework and evidence directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          sed -i "s/net__MAJOR__\.0/net${{ matrix.major }}.0/" r77-sslstream-mtls-policy-resume/R77.csproj
+          dotnet --version | tee evidence/dotnet-version.txt
+          dotnet --info | tee evidence/dotnet-info.txt
+          python --version 2>&1 | tee evidence/python-version.txt
+          git rev-parse HEAD | tee evidence/source-commit.txt
+          printf '%s\n' '${{ matrix.os }}' | tee evidence/runner-os.txt
+          printf '%s\n' '${{ matrix.major }}' | tee evidence/target-major.txt
+          cp r77-sslstream-mtls-policy-resume/Program.cs evidence/Program.cs.txt
+          cp r77-sslstream-mtls-policy-resume/R77.csproj evidence/R77.csproj.txt
+
+      - name: Restore and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore r77-sslstream-mtls-policy-resume/R77.csproj \
+            2>&1 | tee evidence/restore.log
+          dotnet build r77-sslstream-mtls-policy-resume/R77.csproj \
+            --configuration Release --no-restore \
+            2>&1 | tee evidence/build.log
+
+      - name: Run real stock-runtime matrix
+        id: runtime
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          dotnet run \
+            --project r77-sslstream-mtls-policy-resume/R77.csproj \
+            --configuration Release --no-build -- \
+            evidence/result.json \
+            > evidence/console.log 2>&1
+          code=$?
+          printf '%s\n' "$code" | tee evidence/runtime-exit-code.txt
+          cat evidence/console.log
+          test -f evidence/result.json && cat evidence/result.json
+          exit "$code"
+
+      - name: Verify fail-closed result contract
+        id: verify
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python - <<'PY' 2>&1 | tee evidence/verifier.log
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path('evidence/result.json')
+          if not path.exists():
+              print('INVALID_RUNTIME: result.json is missing')
+              raise SystemExit(2)
+
+          data = json.loads(path.read_text(encoding='utf-8'))
+          status = data.get('status')
+          protocols = [p for p in data.get('protocols', []) if p.get('supported')]
+          if not protocols:
+              print('INVALID_RUNTIME: no supported protocol result')
+              raise SystemExit(2)
+
+          for protocol in protocols:
+              trials = protocol.get('trials', [])
+              if len(trials) != 3:
+                  print('INVALID_RUNTIME: incomplete trials', protocol.get('protocol'))
+                  raise SystemExit(2)
+              for trial in trials:
+                  if trial.get('invalidReason') is not None:
+                      print('INVALID_RUNTIME: trial invalid', protocol.get('protocol'), trial.get('trialNumber'), trial.get('invalidReason'))
+                      raise SystemExit(2)
+                  if not trial.get('controlsPassed'):
+                      print('INVALID_RUNTIME: control failure', protocol.get('protocol'), trial.get('trialNumber'))
+                      raise SystemExit(2)
+
+          if status == 'RUNTIME_POSITIVE_REVIEW_REQUIRED':
+              positive = []
+              for protocol in protocols:
+                  for trial in protocol.get('trials', []):
+                      if trial.get('candidatePositive'):
+                          positive.append((protocol.get('protocol'), trial.get('trialNumber')))
+              if not positive:
+                  print('INVALID_RUNTIME: positive status without positive trials')
+                  raise SystemExit(2)
+              print('RUNTIME_POSITIVE_REVIEW_REQUIRED', positive)
+              raise SystemExit(10)
+
+          if status == 'RUNTIME_NEGATIVE_CLOSED':
+              if any(t.get('candidatePositive') for p in protocols for t in p.get('trials', [])):
+                  print('INVALID_RUNTIME: negative status contains a positive trial')
+                  raise SystemExit(2)
+              print('RUNTIME_NEGATIVE_CLOSED')
+              raise SystemExit(0)
+
+          print('INVALID_RUNTIME:', status, data.get('invalidReason'))
+          raise SystemExit(2)
+          PY
+          code=${PIPESTATUS[0]}
+          printf '%s\n' "$code" | tee evidence/verifier-exit-code.txt
+          exit "$code"
+
+      - name: Hash complete evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find evidence -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  evidence/#  #' \
+            > evidence/SHA256SUMS.txt
+          sha256sum -c evidence/SHA256SUMS.txt --ignore-missing
+
+      - name: Upload complete evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r77-${{ matrix.os }}-net${{ matrix.major }}-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Surface final verdict
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f evidence/result.json
+          status=$(python -c 'import json; print(json.load(open("evidence/result.json", encoding="utf-8"))["status"])')
+          case "$status" in
+            RUNTIME_NEGATIVE_CLOSED)
+              exit 0
+              ;;
+            RUNTIME_POSITIVE_REVIEW_REQUIRED)
+              echo "R77 runtime positive: root-cause, duplicate, scope and severity review required." >&2
+              exit 10
+              ;;
+            *)
+              echo "R77 invalid or inconclusive runtime: $status" >&2
+              exit 2
+              ;;
+          esac
