@@ -1,0 +1,345 @@
+name: R78 Base64Url SIMD differential
+
+on:
+  push:
+    branches: [r78-base64url-simd-differential]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stable:
+    name: ${{ matrix.channel }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: stable-net10
+            major: 10
+            sdk: 10.0.404
+          - channel: stable-net11
+            major: 11
+            sdk: 11.0.100
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      COMPlus_TieredCompilation: "0"
+
+    steps:
+      - name: Check out laboratory
+        uses: actions/checkout@v4
+
+      - name: Install exact supported SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Pin SDK and prepare target
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > global.json <<JSON
+          {
+            "sdk": {
+              "version": "${{ matrix.sdk }}",
+              "rollForward": "disable",
+              "allowPrerelease": false
+            }
+          }
+          JSON
+          sed -i "s/net__MAJOR__\.0/net${{ matrix.major }}.0/" r78-base64url-simd-differential/R78.csproj
+          dotnet --version | tee evidence/dotnet-version.txt
+          dotnet --info | tee evidence/dotnet-info.txt
+          python --version 2>&1 | tee evidence/python-version.txt
+          uname -a | tee evidence/uname.txt
+          lscpu | tee evidence/lscpu.txt
+          git rev-parse HEAD | tee evidence/source-commit.txt
+          printf '%s\n' '${{ matrix.channel }}' | tee evidence/channel.txt
+          cp r78-base64url-simd-differential/Program.cs evidence/Program.cs.txt
+          cp r78-base64url-simd-differential/compare.py evidence/compare.py.txt
+          cp r78-base64url-simd-differential/R78.csproj evidence/R78.csproj.txt
+          cp global.json evidence/global.json.txt
+
+      - name: Restore and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore r78-base64url-simd-differential/R78.csproj \
+            2>&1 | tee evidence/restore.log
+          dotnet build r78-base64url-simd-differential/R78.csproj \
+            --configuration Release --no-restore \
+            2>&1 | tee evidence/build.log
+
+      - name: Run default hardware path
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet run \
+            --project r78-base64url-simd-differential/R78.csproj \
+            --configuration Release --no-build -- \
+            default evidence/default.json \
+            2>&1 | tee evidence/default-console.log
+
+      - name: Run AVX2-disabled path
+        shell: bash
+        env:
+          COMPlus_EnableAVX2: "0"
+          DOTNET_EnableAVX2: "0"
+        run: |
+          set -euo pipefail
+          dotnet run \
+            --project r78-base64url-simd-differential/R78.csproj \
+            --configuration Release --no-build -- \
+            avx2off evidence/avx2off.json \
+            2>&1 | tee evidence/avx2off-console.log
+
+      - name: Run scalar path
+        shell: bash
+        env:
+          COMPlus_EnableHWIntrinsic: "0"
+          DOTNET_EnableHWIntrinsic: "0"
+        run: |
+          set -euo pipefail
+          dotnet run \
+            --project r78-base64url-simd-differential/R78.csproj \
+            --configuration Release --no-build -- \
+            scalar evidence/scalar.json \
+            2>&1 | tee evidence/scalar-console.log
+
+      - name: Compare all execution modes
+        id: compare
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python r78-base64url-simd-differential/compare.py \
+            '${{ matrix.channel }}' \
+            evidence/default.json \
+            evidence/avx2off.json \
+            evidence/scalar.json \
+            evidence/comparison.json \
+            2>&1 | tee evidence/comparison-console.log
+          code=${PIPESTATUS[0]}
+          printf '%s\n' "$code" | tee evidence/comparison-exit-code.txt
+          exit "$code"
+
+      - name: Hash evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd evidence
+            find . -type f ! -name SHA256SUMS.txt -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS.txt
+            sha256sum -c SHA256SUMS.txt
+          )
+
+      - name: Upload complete evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r78-${{ matrix.channel }}-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Surface verdict
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f evidence/comparison.json
+          status=$(python -c 'import json; print(json.load(open("evidence/comparison.json"))["status"])')
+          case "$status" in
+            RUNTIME_NEGATIVE_CLOSED|PUBLIC_KNOWN_CONTROL_ONLY)
+              exit 0
+              ;;
+            FRESH_RUNTIME_POSITIVE_REVIEW_REQUIRED)
+              echo "R78 fresh supported-release signal: fixed-daily and duplicate review required." >&2
+              exit 10
+              ;;
+            *)
+              echo "R78 invalid runtime: $status" >&2
+              exit 2
+              ;;
+          esac
+
+  fixed-daily:
+    name: fixed-main-daily-net12
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      COMPlus_TieredCompilation: "0"
+
+    steps:
+      - name: Check out laboratory
+        uses: actions/checkout@v4
+
+      - name: Install current .NET 12 daily SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+          bash /tmp/dotnet-install.sh \
+            --channel 12.0.1xx \
+            --quality daily \
+            --install-dir "$HOME/.dotnet12" \
+            --no-path
+          echo "$HOME/.dotnet12" >> "$GITHUB_PATH"
+          echo "DOTNET_ROOT=$HOME/.dotnet12" >> "$GITHUB_ENV"
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Pin daily SDK and prepare target
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          sdk=$(dotnet --version)
+          cat > global.json <<JSON
+          {
+            "sdk": {
+              "version": "$sdk",
+              "rollForward": "disable",
+              "allowPrerelease": true
+            }
+          }
+          JSON
+          sed -i "s/net__MAJOR__\.0/net12.0/" r78-base64url-simd-differential/R78.csproj
+          dotnet --version | tee evidence/dotnet-version.txt
+          dotnet --info | tee evidence/dotnet-info.txt
+          python --version 2>&1 | tee evidence/python-version.txt
+          uname -a | tee evidence/uname.txt
+          lscpu | tee evidence/lscpu.txt
+          git rev-parse HEAD | tee evidence/source-commit.txt
+          printf '%s\n' 'fixed-main-daily-net12' | tee evidence/channel.txt
+          printf '%s\n' '7ad74025fa5c5ea0f8e082fa318c1c91329fe3a1' \
+            | tee evidence/public-fix-commit.txt
+          cp r78-base64url-simd-differential/Program.cs evidence/Program.cs.txt
+          cp r78-base64url-simd-differential/compare.py evidence/compare.py.txt
+          cp r78-base64url-simd-differential/R78.csproj evidence/R78.csproj.txt
+          cp global.json evidence/global.json.txt
+
+      - name: Restore and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore r78-base64url-simd-differential/R78.csproj \
+            2>&1 | tee evidence/restore.log
+          dotnet build r78-base64url-simd-differential/R78.csproj \
+            --configuration Release --no-restore \
+            2>&1 | tee evidence/build.log
+
+      - name: Run default hardware path
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet run \
+            --project r78-base64url-simd-differential/R78.csproj \
+            --configuration Release --no-build -- \
+            default evidence/default.json \
+            2>&1 | tee evidence/default-console.log
+
+      - name: Run AVX2-disabled path
+        shell: bash
+        env:
+          COMPlus_EnableAVX2: "0"
+          DOTNET_EnableAVX2: "0"
+        run: |
+          set -euo pipefail
+          dotnet run \
+            --project r78-base64url-simd-differential/R78.csproj \
+            --configuration Release --no-build -- \
+            avx2off evidence/avx2off.json \
+            2>&1 | tee evidence/avx2off-console.log
+
+      - name: Run scalar path
+        shell: bash
+        env:
+          COMPlus_EnableHWIntrinsic: "0"
+          DOTNET_EnableHWIntrinsic: "0"
+        run: |
+          set -euo pipefail
+          dotnet run \
+            --project r78-base64url-simd-differential/R78.csproj \
+            --configuration Release --no-build -- \
+            scalar evidence/scalar.json \
+            2>&1 | tee evidence/scalar-console.log
+
+      - name: Compare all execution modes
+        id: compare
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python r78-base64url-simd-differential/compare.py \
+            fixed-main-daily-net12 \
+            evidence/default.json \
+            evidence/avx2off.json \
+            evidence/scalar.json \
+            evidence/comparison.json \
+            2>&1 | tee evidence/comparison-console.log
+          code=${PIPESTATUS[0]}
+          printf '%s\n' "$code" | tee evidence/comparison-exit-code.txt
+          exit "$code"
+
+      - name: Hash evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd evidence
+            find . -type f ! -name SHA256SUMS.txt -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS.txt
+            sha256sum -c SHA256SUMS.txt
+          )
+
+      - name: Upload complete evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r78-fixed-main-daily-net12-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Surface verdict
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f evidence/comparison.json
+          status=$(python -c 'import json; print(json.load(open("evidence/comparison.json"))["status"])')
+          case "$status" in
+            RUNTIME_NEGATIVE_CLOSED|PUBLIC_KNOWN_CONTROL_ONLY)
+              exit 0
+              ;;
+            FRESH_RUNTIME_POSITIVE_REVIEW_REQUIRED)
+              echo "R78 signal survives the fixed daily runtime; root-cause review required." >&2
+              exit 10
+              ;;
+            *)
+              echo "R78 invalid daily runtime: $status" >&2
+              exit 2
+              ;;
+          esac
