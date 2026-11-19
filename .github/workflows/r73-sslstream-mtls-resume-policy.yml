@@ -34,6 +34,25 @@ jobs:
           git rev-parse HEAD | tee evidence/source-commit.txt
           sha256sum "$(command -v dotnet)" | tee evidence/dotnet-host-sha256.txt
 
+      - name: Apply deterministic delegate compile repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee evidence/source-repair.log
+          from pathlib import Path
+          path = Path("r73-sslstream-mtls-resume-policy/Program.cs")
+          old = "RemoteCertificateValidationCallback = validationProbe?.Validate,"
+          new = "RemoteCertificateValidationCallback = validationProbe is null ? null : validationProbe.Validate,"
+          text = path.read_text(encoding="utf-8")
+          if text.count(old) != 1:
+              raise SystemExit(f"expected exactly one nullable method-group expression, found {text.count(old)}")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          print("R73_DELEGATE_COMPILE_REPAIR_APPLIED")
+          PY
+          cp r73-sslstream-mtls-resume-policy/Program.cs evidence/Program.patched.cs.txt
+          sha256sum r73-sslstream-mtls-resume-policy/Program.cs \
+            | tee evidence/patched-source-sha256.txt
+
       - name: Build harness
         shell: bash
         run: |
