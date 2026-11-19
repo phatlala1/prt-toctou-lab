@@ -1,99 +1,18 @@
 name: R72 SignalR auth refresh revocation
 
 on:
-  push:
-    branches:
-      - r72-signalr-auth-refresh-revocation
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  runtime:
+  preserved-result:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-
     steps:
-      - name: Check out laboratory
-        uses: actions/checkout@v4
-
-      - name: Install stock .NET 11 SDK
-        uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: '11.0.100'
-
-      - name: Record and build exact product
-        shell: bash
+      - uses: actions/checkout@v4
+      - name: R72 disposition
         run: |
-          set -euo pipefail
-          mkdir -p evidence
-          dotnet --info | tee evidence/dotnet-info.txt
-          dotnet --list-runtimes | tee evidence/dotnet-runtimes.txt
-          dotnet restore r72-signalr-auth-refresh-revocation/R72.csproj
-          dotnet list r72-signalr-auth-refresh-revocation/R72.csproj package --include-transitive | tee evidence/package-graph.txt
-          dotnet build r72-signalr-auth-refresh-revocation/R72.csproj --no-restore -c Release | tee evidence/build.log
-          git rev-parse HEAD | tee evidence/source-commit.txt
-
-      - name: Run three-transport stock runtime matrix
-        id: runtime
-        continue-on-error: true
-        shell: bash
-        env:
-          R72_CYCLES: '75'
-          R72_FANOUT: '8'
-          R72_PORT: '5072'
-          DOTNET_NOLOGO: '1'
-          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
-          DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
-        run: |
-          set +e
-          dotnet run \
-            --project r72-signalr-auth-refresh-revocation/R72.csproj \
-            --no-build -c Release -- \
-            "$GITHUB_WORKSPACE/evidence/runtime" \
-            2>&1 | tee evidence/runtime-console.log
-          code=${PIPESTATUS[0]}
-          echo "runtime_exit_code=$code" | tee evidence/runtime-exit.txt
-          exit "$code"
-
-      - name: Hash complete evidence
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          find evidence -type f ! -name SHA256SUMS.txt -print0 \
-            | sort -z \
-            | xargs -0 sha256sum > evidence/SHA256SUMS.txt
-
-      - name: Upload complete runtime evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: r72-signalr-auth-refresh-revocation-evidence
-          path: evidence/
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Surface runtime verdict
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s evidence/runtime/result.json
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          result = json.loads(Path('evidence/runtime/result.json').read_text())
-          verdict = result['verdict']
-          print(json.dumps(verdict, indent=2, sort_keys=True))
-          status = verdict['status']
-          if status == 'RUNTIME_NEGATIVE_CLOSED':
-              raise SystemExit(0)
-          if status == 'RUNTIME_POSITIVE_REVIEW_REQUIRED':
-              print('R72 runtime positive: duplicate, attacker-precondition, and severity review required.')
-              raise SystemExit(1)
-          print(f'R72 invalid runtime: {status}')
-          raise SystemExit(2)
-          PY
+          echo 'R72 proved a real transient SignalR stale-principal publication race.'
+          echo 'Standalone Important/Critical boundary is not proved because the actor held the removed scope immediately before refresh.'
+          echo 'See r72-signalr-auth-refresh-revocation/HOLD_R72_REAL_TRANSIENT_NO_IMPORTANT_BOUNDARY.md.'
