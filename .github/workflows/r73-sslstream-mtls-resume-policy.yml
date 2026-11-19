@@ -1,0 +1,131 @@
+name: R73 SslStream mTLS resumption policy
+
+on:
+  push:
+    branches: [r73-sslstream-mtls-resume-policy]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out laboratory
+        uses: actions/checkout@v4
+
+      - name: Install stock .NET 11 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 11.0.100
+
+      - name: Record environment and product identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          dotnet --info | tee evidence/dotnet-info.txt
+          dotnet --list-runtimes | tee evidence/dotnet-runtimes.txt
+          openssl version -a | tee evidence/openssl-version.txt
+          uname -a | tee evidence/uname.txt
+          id | tee evidence/id.txt
+          git rev-parse HEAD | tee evidence/source-commit.txt
+          sha256sum "$(command -v dotnet)" | tee evidence/dotnet-host-sha256.txt
+
+      - name: Build harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore r73-sslstream-mtls-resume-policy/R73.csproj
+          dotnet build r73-sslstream-mtls-resume-policy/R73.csproj \
+            --configuration Release --no-restore \
+            | tee evidence/build.log
+
+      - name: Run current default behavior
+        shell: bash
+        env:
+          DOTNET_SYSTEM_NET_SECURITY_REVALIDATECERTIFICATEONTLSRESUME: "0"
+          DOTNET_SYSTEM_NET_SECURITY_TLSCACHESIZE: "500"
+          DOTNET_NOLOGO: "1"
+          DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+        run: |
+          set -euo pipefail
+          dotnet run \
+            --project r73-sslstream-mtls-resume-policy/R73.csproj \
+            --configuration Release --no-build -- \
+            default evidence/default.json \
+            2>&1 | tee evidence/default-console.log
+
+      - name: Run revalidation opt-out control
+        shell: bash
+        env:
+          DOTNET_SYSTEM_NET_SECURITY_REVALIDATECERTIFICATEONTLSRESUME: "1"
+          DOTNET_SYSTEM_NET_SECURITY_TLSCACHESIZE: "500"
+          DOTNET_NOLOGO: "1"
+          DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+        run: |
+          set -euo pipefail
+          dotnet run \
+            --project r73-sslstream-mtls-resume-policy/R73.csproj \
+            --configuration Release --no-build -- \
+            revalidate evidence/revalidate.json \
+            2>&1 | tee evidence/revalidate-console.log
+
+      - name: Verify controls and runtime verdict
+        id: verify
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python3 r73-sslstream-mtls-resume-policy/verify.py \
+            evidence/default.json \
+            evidence/revalidate.json \
+            evidence/result.json \
+            2>&1 | tee evidence/verifier-console.log
+          code=${PIPESTATUS[0]}
+          echo "verifier_exit_code=$code" | tee evidence/verifier-exit.txt
+          exit "$code"
+
+      - name: Hash complete evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find evidence -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  evidence/#  #' \
+            > evidence/SHA256SUMS.txt
+
+      - name: Upload complete runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r73-sslstream-mtls-resume-policy-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Surface verdict
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f evidence/result.json
+          status=$(python3 -c 'import json; print(json.load(open("evidence/result.json"))["verdict"]["status"])')
+          cat evidence/result.json
+          case "$status" in
+            RUNTIME_NEGATIVE_CLOSED)
+              exit 0
+              ;;
+            RUNTIME_POSITIVE_REVIEW_REQUIRED)
+              echo "R73 runtime positive: duplicate and MSRC boundary review required." >&2
+              exit 10
+              ;;
+            *)
+              echo "R73 runtime invalid: $status" >&2
+              exit 2
+              ;;
+          esac
