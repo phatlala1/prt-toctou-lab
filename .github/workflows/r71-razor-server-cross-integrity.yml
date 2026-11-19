@@ -62,13 +62,15 @@ jobs:
           python r71-razor-server-cross-integrity/instrument-trial.py 2>&1 | Tee-Object evidence/instrument-trial.log
           python r71-razor-server-cross-integrity/instrument-client.py 2>&1 | Tee-Object evidence/instrument-client.log
           python r71-razor-server-cross-integrity/instrument-task.py 2>&1 | Tee-Object evidence/instrument-task.log
+          python r71-razor-server-cross-integrity/instrument-launch.py 2>&1 | Tee-Object evidence/instrument-launch.log
           Copy-Item r71-razor-server-cross-integrity/Program.cs evidence/Program.patched.txt
           Get-FileHash -Algorithm SHA256 `
             r71-razor-server-cross-integrity/Program.cs, `
             r71-razor-server-cross-integrity/fix-readiness.py, `
             r71-razor-server-cross-integrity/instrument-trial.py, `
             r71-razor-server-cross-integrity/instrument-client.py, `
-            r71-razor-server-cross-integrity/instrument-task.py |
+            r71-razor-server-cross-integrity/instrument-task.py, `
+            r71-razor-server-cross-integrity/instrument-launch.py |
             Format-Table -AutoSize | Out-File evidence/source-sha256.txt
 
       - name: Build harness and extension
@@ -78,7 +80,7 @@ jobs:
           dotnet build r71-razor-server-cross-integrity/R71Extension/R71Extension.csproj -c Release 2>&1 | Tee-Object evidence/build-extension.log
           dotnet build r71-razor-server-cross-integrity/R71.csproj -c Release 2>&1 | Tee-Object evidence/build-harness.log
 
-      - name: Run three real stock-product trials
+      - name: Run restricted-bootstrap diagnostic
         id: runtime
         continue-on-error: true
         shell: pwsh
