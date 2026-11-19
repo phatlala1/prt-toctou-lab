@@ -65,6 +65,7 @@ jobs:
           python r71-razor-server-cross-integrity/instrument-launch.py 2>&1 | Tee-Object evidence/instrument-launch.log
           python r71-razor-server-cross-integrity/instrument-apphost.py 2>&1 | Tee-Object evidence/instrument-apphost.log
           python r71-razor-server-cross-integrity/instrument-resume.py 2>&1 | Tee-Object evidence/instrument-resume.log
+          python r71-razor-server-cross-integrity/instrument-lua-token.py 2>&1 | Tee-Object evidence/instrument-lua-token.log
           Copy-Item r71-razor-server-cross-integrity/Program.cs evidence/Program.patched.txt
           Get-FileHash -Algorithm SHA256 `
             r71-razor-server-cross-integrity/Program.cs, `
@@ -74,7 +75,8 @@ jobs:
             r71-razor-server-cross-integrity/instrument-task.py, `
             r71-razor-server-cross-integrity/instrument-launch.py, `
             r71-razor-server-cross-integrity/instrument-apphost.py, `
-            r71-razor-server-cross-integrity/instrument-resume.py |
+            r71-razor-server-cross-integrity/instrument-resume.py, `
+            r71-razor-server-cross-integrity/instrument-lua-token.py |
             Format-Table -AutoSize | Out-File evidence/source-sha256.txt
 
       - name: Build harness and extension
@@ -84,7 +86,7 @@ jobs:
           dotnet build r71-razor-server-cross-integrity/R71Extension/R71Extension.csproj -c Release 2>&1 | Tee-Object evidence/build-extension.log
           dotnet build r71-razor-server-cross-integrity/R71.csproj -c Release 2>&1 | Tee-Object evidence/build-harness.log
 
-      - name: Run explicit-resume diagnostic
+      - name: Run LUA-token diagnostic
         id: runtime
         continue-on-error: true
         shell: pwsh
