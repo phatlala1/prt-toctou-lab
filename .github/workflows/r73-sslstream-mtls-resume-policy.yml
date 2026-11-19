@@ -41,38 +41,44 @@ jobs:
           python3 - <<'PY' | tee evidence/source-repair.log
           from pathlib import Path
 
-          path = Path("r73-sslstream-mtls-resume-policy/Program.cs")
-          text = path.read_text(encoding="utf-8")
-
+          legacy = Path("r73-sslstream-mtls-resume-policy/Program.cs")
+          text = legacy.read_text(encoding="utf-8")
           repairs = [
               (
                   "RemoteCertificateValidationCallback = validationProbe?.Validate,",
                   "RemoteCertificateValidationCallback = validationProbe is null ? null : validationProbe.Validate,",
-                  "nullable delegate",
+                  "legacy nullable delegate",
               ),
               (
                   "            WriteIndented = true,\n            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,",
                   "            WriteIndented = true,\n            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,\n            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,",
-                  "camelCase JSON contract",
+                  "legacy camelCase JSON contract",
               ),
               (
                   "            return resumedProperty?.GetValue(connectionInfo) as bool?;",
                   "            object? resumedValue = resumedProperty?.GetValue(connectionInfo);\n            return resumedValue is bool resumed ? resumed : null;",
-                  "boxed TLS resumed reflection",
+                  "legacy boxed TLS resumed reflection",
               ),
           ]
-
           for old, new, name in repairs:
               count = text.count(old)
               if count != 1:
                   raise SystemExit(f"expected exactly one {name} target, found {count}")
               text = text.replace(old, new)
               print(f"R73_REPAIR_APPLIED={name}")
+          legacy.write_text(text, encoding="utf-8")
 
-          path.write_text(text, encoding="utf-8")
+          v2 = Path("r73-sslstream-mtls-resume-policy/ProgramV2.cs")
+          v2text = v2.read_text(encoding="utf-8")
+          old = ".ShutdownAsync(timeout.Token)"
+          count = v2text.count(old)
+          if count != 2:
+              raise SystemExit(f"expected exactly two v2 ShutdownAsync targets, found {count}")
+          v2.write_text(v2text.replace(old, ".ShutdownAsync()"), encoding="utf-8")
+          print("R73_REPAIR_APPLIED=v2 ShutdownAsync signature")
           PY
-          cp r73-sslstream-mtls-resume-policy/Program.cs evidence/Program.patched.cs.txt
-          sha256sum r73-sslstream-mtls-resume-policy/Program.cs \
+          cp r73-sslstream-mtls-resume-policy/ProgramV2.cs evidence/ProgramV2.patched.cs.txt
+          sha256sum r73-sslstream-mtls-resume-policy/ProgramV2.cs \
             | tee evidence/patched-source-sha256.txt
 
       - name: Build harness
