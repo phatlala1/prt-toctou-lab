@@ -56,24 +56,8 @@ jobs:
                   "camelCase JSON contract",
               ),
               (
-                  '''            object? connectionInfo = ConnectionInfoField?.GetValue(stream);
-            PropertyInfo? resumedProperty = connectionInfo?.GetType().GetProperty(
-                "TlsResumed",
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            return resumedProperty?.GetValue(connectionInfo) as bool?;''',
-                  '''            object? connectionInfo = ConnectionInfoField?.GetValue(stream);
-            if (connectionInfo is null)
-            {
-                return null;
-            }
-
-            PropertyInfo? resumedProperty = typeof(SslStream).Assembly
-                .GetType("System.Net.Security.SslConnectionInfo")?
-                .GetProperty(
-                    "TlsResumed",
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            object? value = resumedProperty?.GetValue(connectionInfo);
-            return value is bool resumed ? resumed : null;''',
+                  "            return resumedProperty?.GetValue(connectionInfo) as bool?;",
+                  "            object? resumedValue = resumedProperty?.GetValue(connectionInfo);\n            return resumedValue is bool resumed ? resumed : null;",
                   "boxed TLS resumed reflection",
               ),
           ]
