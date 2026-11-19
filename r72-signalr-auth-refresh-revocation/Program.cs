@@ -12,8 +12,6 @@ using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.Options;
 
 const string AuthenticationScheme = "R72Lab";
-const string RequiredScope = "signalr:invoke";
-const string UserId = "user-a";
 
 var evidenceDirectory = Path.GetFullPath(args.Length > 0 ? args[0] : "evidence");
 Directory.CreateDirectory(evidenceDirectory);
