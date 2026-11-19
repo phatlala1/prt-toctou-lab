@@ -1,0 +1,118 @@
+name: R73 net12 resumed certificate-policy PoC
+
+on:
+  push:
+    branches: [r73-net12-runtime-poc]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install current .NET 12 daily SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+          bash /tmp/dotnet-install.sh \
+            --channel 12.0.1xx \
+            --quality daily \
+            --install-dir "$HOME/.dotnet12" \
+            --no-path
+          echo "$HOME/.dotnet12" >> "$GITHUB_PATH"
+          echo "DOTNET_ROOT=$HOME/.dotnet12" >> "$GITHUB_ENV"
+
+      - name: Record runtime identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          dotnet --info | tee evidence/dotnet-info.txt
+          dotnet --list-runtimes | tee evidence/dotnet-runtimes.txt
+          openssl version -a | tee evidence/openssl-version.txt
+          uname -a | tee evidence/uname.txt
+          git rev-parse HEAD | tee evidence/source-commit.txt
+
+      - name: Build PoC
+        shell: bash
+        working-directory: r73-net12-runtime-poc
+        run: |
+          set -euo pipefail
+          dotnet restore R73.csproj
+          dotnet build R73.csproj -c Release --no-restore \
+            | tee ../evidence/build.log
+
+      - name: Run default behavior
+        shell: bash
+        working-directory: r73-net12-runtime-poc
+        run: |
+          set +e
+          dotnet run --project R73.csproj -c Release --no-build -- \
+            default ../evidence/default.json \
+            2>&1 | tee ../evidence/default-console.log
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > ../evidence/default-exit.txt
+          exit 0
+
+      - name: Run revalidation control
+        shell: bash
+        working-directory: r73-net12-runtime-poc
+        run: |
+          set +e
+          dotnet run --project R73.csproj -c Release --no-build -- \
+            revalidate ../evidence/revalidate.json \
+            2>&1 | tee ../evidence/revalidate-console.log
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > ../evidence/revalidate-exit.txt
+          exit 0
+
+      - name: Verify combined result
+        shell: bash
+        working-directory: r73-net12-runtime-poc
+        run: |
+          set +e
+          python3 verify.py ../evidence/default.json ../evidence/revalidate.json \
+            2>&1 | tee ../evidence/verifier.log
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > ../evidence/verifier-exit.txt
+          exit 0
+
+      - name: Hash evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find evidence -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r73-net12-runtime-poc-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Surface verdict
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          d=json.load(open('evidence/default.json'))
+          r=json.load(open('evidence/revalidate.json'))
+          print('default:', d['status'])
+          print('revalidate:', r['status'])
+          if d['status'] != 'RUNTIME_POSITIVE_REVIEW_REQUIRED':
+              raise SystemExit('default mode did not establish a runtime positive')
+          if r['status'] != 'REVALIDATION_CONTROL_PASSED':
+              raise SystemExit('revalidation control did not pass')
+          PY
