@@ -34,20 +34,58 @@ jobs:
           git rev-parse HEAD | tee evidence/source-commit.txt
           sha256sum "$(command -v dotnet)" | tee evidence/dotnet-host-sha256.txt
 
-      - name: Apply deterministic delegate compile repair
+      - name: Apply deterministic harness repairs
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY' | tee evidence/source-repair.log
           from pathlib import Path
+
           path = Path("r73-sslstream-mtls-resume-policy/Program.cs")
-          old = "RemoteCertificateValidationCallback = validationProbe?.Validate,"
-          new = "RemoteCertificateValidationCallback = validationProbe is null ? null : validationProbe.Validate,"
           text = path.read_text(encoding="utf-8")
-          if text.count(old) != 1:
-              raise SystemExit(f"expected exactly one nullable method-group expression, found {text.count(old)}")
-          path.write_text(text.replace(old, new), encoding="utf-8")
-          print("R73_DELEGATE_COMPILE_REPAIR_APPLIED")
+
+          repairs = [
+              (
+                  "RemoteCertificateValidationCallback = validationProbe?.Validate,",
+                  "RemoteCertificateValidationCallback = validationProbe is null ? null : validationProbe.Validate,",
+                  "nullable delegate",
+              ),
+              (
+                  "            WriteIndented = true,\n            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,",
+                  "            WriteIndented = true,\n            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,\n            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,",
+                  "camelCase JSON contract",
+              ),
+              (
+                  '''            object? connectionInfo = ConnectionInfoField?.GetValue(stream);
+            PropertyInfo? resumedProperty = connectionInfo?.GetType().GetProperty(
+                "TlsResumed",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            return resumedProperty?.GetValue(connectionInfo) as bool?;''',
+                  '''            object? connectionInfo = ConnectionInfoField?.GetValue(stream);
+            if (connectionInfo is null)
+            {
+                return null;
+            }
+
+            PropertyInfo? resumedProperty = typeof(SslStream).Assembly
+                .GetType("System.Net.Security.SslConnectionInfo")?
+                .GetProperty(
+                    "TlsResumed",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            object? value = resumedProperty?.GetValue(connectionInfo);
+            return value is bool resumed ? resumed : null;''',
+                  "boxed TLS resumed reflection",
+              ),
+          ]
+
+          for old, new, name in repairs:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one {name} target, found {count}")
+              text = text.replace(old, new)
+              print(f"R73_REPAIR_APPLIED={name}")
+
+          path.write_text(text, encoding="utf-8")
           PY
           cp r73-sslstream-mtls-resume-policy/Program.cs evidence/Program.patched.cs.txt
           sha256sum r73-sslstream-mtls-resume-policy/Program.cs \
