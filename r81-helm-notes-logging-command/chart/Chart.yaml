@@ -1,0 +1,4 @@
+apiVersion: v2
+name: r81-owned-lab
+version: 1.0.0
+description: Benign owned-lab chart for HelmDeploy@1 stdout validation
