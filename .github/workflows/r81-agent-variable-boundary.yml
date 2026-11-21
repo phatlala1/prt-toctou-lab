@@ -1,0 +1,139 @@
+name: R81 Azure Pipelines agent variable boundary
+
+on:
+  push:
+    branches: [r81-servicefabric-feature-flag-bypass]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-variable-agent-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out R81 laboratory
+        uses: actions/checkout@v4
+        with:
+          path: lab
+
+      - name: Check out pinned Azure Pipelines agent
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/azure-pipelines-agent
+          ref: af087fe2880e468e02b8974adc25c26399b78d98
+          path: agent
+
+      - name: Inject exact-variable test into official agent test project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cp lab/r81-servicefabric-feature-flag-bypass/R81FeatureVariableL0.cs \
+            agent/src/Test/L0/Worker/R81FeatureVariableL0.cs
+          git -C agent rev-parse HEAD | tee evidence/agent-commit.txt
+          sha256sum agent/src/Agent.Worker/TaskCommandExtension.cs \
+            agent/src/Agent.Worker/Variables.cs \
+            agent/src/Agent.Worker/TaskRestrictionsChecker.cs \
+            agent/src/Test/L0/Worker/R81FeatureVariableL0.cs \
+            | tee evidence/source-sha256.txt
+          uname -a | tee evidence/uname.txt
+
+      - name: Execute official Agent.Worker L0 tests
+        id: tests
+        continue-on-error: true
+        working-directory: agent/src
+        shell: bash
+        env:
+          TF_BUILD: "True"
+        run: |
+          set +e
+          ./dev.sh testl0 net10.0 Debug linux-x64 \
+            'FullyQualifiedName~R81FeatureVariableL0' \
+            2>&1 | tee ../../evidence/agent-l0-console.log
+          code=${PIPESTATUS[0]}
+          echo "testExitCode=$code" | tee ../../evidence/test-exit.txt
+          exit "$code"
+
+      - name: Build fail-closed verdict
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+
+          evidence = pathlib.Path('evidence')
+          log_path = evidence / 'agent-l0-console.log'
+          log = log_path.read_text(errors='replace') if log_path.exists() else ''
+          exit_path = evidence / 'test-exit.txt'
+          match = re.search(r'testExitCode=(-?\d+)', exit_path.read_text() if exit_path.exists() else '')
+          exit_code = int(match.group(1)) if match else None
+
+          expected = [
+              'UnrestrictedTaskCanCreateExactServiceFabricKillSwitchVariable',
+              'ExistingReadOnlyVariableIsStillOverwrittenWhileRolloutKnobIsFalse',
+              'AgentReadOnlyEnforcementKnobBlocksOverwriteControl',
+              'ExplicitSettableVariableRestrictionBlocksKillSwitchControl',
+          ]
+          observed = {name: name in log for name in expected}
+          tests_passed = exit_code == 0 and all(observed.values())
+          status = (
+              'OFFICIAL_AGENT_VARIABLE_BOUNDARY_POSITIVE'
+              if tests_passed
+              else 'INVALID_RUNTIME'
+          )
+          result = {
+              'schema': 'r81-agent-variable-boundary/v1',
+              'status': status,
+              'testsPassed': tests_passed,
+              'testExitCode': exit_code,
+              'expectedTestsObservedInLog': observed,
+              'claim': (
+                  'The pinned Azure Pipelines Agent command handler accepts the exact '
+                  'ServiceFabricDeploy authority-check kill-switch variable from an '
+                  'unrestricted task. Explicit settable-variable restrictions and the '
+                  'read-only enforcement knob are effective controls.'
+              ),
+              'claimLimit': (
+                  'This does not prove a restricted Azure DevOps user can reach a protected '
+                  'service connection. A hosted Azure DevOps actor/permission matrix remains required.'
+              ),
+          }
+          (evidence / 'agent-boundary-result.json').write_text(
+              json.dumps(result, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+          find evidence -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  evidence/#  #' \
+            > evidence/SHA256SUMS.txt
+
+      - name: Upload agent actor-gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r81-agent-variable-boundary-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Surface verdict
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=$(python3 -c 'import json; print(json.load(open("evidence/agent-boundary-result.json"))["status"])')
+          cat evidence/agent-boundary-result.json
+          if [[ "$status" == 'OFFICIAL_AGENT_VARIABLE_BOUNDARY_POSITIVE' ]]; then
+            echo 'R81 official agent variable gate passed; hosted Azure DevOps actor gate remains.' >&2
+            exit 10
+          fi
+          echo "R81 agent variable runtime invalid: $status" >&2
+          exit 2
