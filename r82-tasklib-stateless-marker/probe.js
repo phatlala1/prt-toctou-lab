@@ -5,14 +5,22 @@ const path = require('path');
 const stream = require('stream');
 
 if (process.argv.length !== 4) {
-  console.error('usage: node probe.js <task-lib-node-directory> <result.json>');
+  console.error('usage: node probe.js <task-lib-compiled-directory> <result.json>');
   process.exit(2);
 }
 
-const taskLibNode = path.resolve(process.argv[2]);
+const compiledDirectory = path.resolve(process.argv[2]);
 const resultPath = path.resolve(process.argv[3]);
-const taskLib = require(path.join(taskLibNode, 'task.js'));
-const externalOutput = require(path.join(taskLibNode, 'externaloutput.js'));
+const taskLib = require(path.join(compiledDirectory, 'task.js'));
+const externalOutput = require(path.join(compiledDirectory, 'externaloutput.js'));
+const packagePathCandidates = [
+  path.join(compiledDirectory, 'package.json'),
+  path.join(compiledDirectory, '..', 'package.json'),
+];
+const packagePath = packagePathCandidates.find(candidate => fs.existsSync(candidate));
+if (!packagePath) {
+  throw new Error(`task-lib package.json not found near ${compiledDirectory}`);
+}
 
 function capture(action) {
   const sink = new stream.PassThrough();
@@ -52,7 +60,8 @@ const neutralizedMarker = '##_vso[task.setvariable variable=R82_SYNTHETIC]true';
 
 const result = {
   schema: 'r82-tasklib-stateless-marker-differential/v1',
-  taskLibVersion: require(path.join(taskLibNode, 'package.json')).version,
+  taskLibVersion: require(packagePath).version,
+  compiledDirectory,
   splitAcrossIndependentCalls,
   completeSingleCall,
   statefulWriter,
