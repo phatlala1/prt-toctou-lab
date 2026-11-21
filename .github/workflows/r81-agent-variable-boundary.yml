@@ -33,6 +33,8 @@ jobs:
           mkdir -p evidence
           cp lab/r81-servicefabric-feature-flag-bypass/R81FeatureVariableL0.cs \
             agent/src/Test/L0/Worker/R81FeatureVariableL0.cs
+          cp agent/src/Test/L0/Worker/R81FeatureVariableL0.cs \
+            evidence/R81FeatureVariableL0.cs.txt
           git -C agent rev-parse HEAD | tee evidence/agent-commit.txt
           sha256sum agent/src/Agent.Worker/TaskCommandExtension.cs \
             agent/src/Agent.Worker/Variables.cs \
@@ -55,6 +57,8 @@ jobs:
             2>&1 | tee ../../evidence/agent-l0-console.log
           code=${PIPESTATUS[0]}
           echo "testExitCode=$code" | tee ../../evidence/test-exit.txt
+          find Test/TestResults -type f \( -name '*.trx' -o -name '*.coverage' \) \
+            -exec cp -f {} ../../evidence/ \; 2>/dev/null || true
           exit "$code"
 
       - name: Build fail-closed verdict
@@ -74,30 +78,45 @@ jobs:
           match = re.search(r'testExitCode=(-?\d+)', exit_path.read_text() if exit_path.exists() else '')
           exit_code = int(match.group(1)) if match else None
 
+          summary_pattern = re.compile(
+              r'Passed!\s+-\s+Failed:\s+0,\s+Passed:\s+4,\s+Skipped:\s+0,\s+Total:\s+4',
+              re.MULTILINE,
+          )
+          summary_match = summary_pattern.search(log)
+          trx_files = sorted(path.name for path in evidence.glob('*.trx'))
+          source = (evidence / 'R81FeatureVariableL0.cs.txt').read_text(errors='replace')
           expected = [
               'UnrestrictedTaskCanCreateExactServiceFabricKillSwitchVariable',
               'ExistingReadOnlyVariableIsStillOverwrittenWhileRolloutKnobIsFalse',
               'AgentReadOnlyEnforcementKnobBlocksOverwriteControl',
               'ExplicitSettableVariableRestrictionBlocksKillSwitchControl',
           ]
-          observed = {name: name in log for name in expected}
-          tests_passed = exit_code == 0 and all(observed.values())
+          methods_present = {name: name in source for name in expected}
+          tests_passed = (
+              exit_code == 0
+              and summary_match is not None
+              and bool(trx_files)
+              and all(methods_present.values())
+          )
           status = (
               'OFFICIAL_AGENT_VARIABLE_BOUNDARY_POSITIVE'
               if tests_passed
               else 'INVALID_RUNTIME'
           )
           result = {
-              'schema': 'r81-agent-variable-boundary/v1',
+              'schema': 'r81-agent-variable-boundary/v2',
               'status': status,
               'testsPassed': tests_passed,
               'testExitCode': exit_code,
-              'expectedTestsObservedInLog': observed,
+              'testSummary': summary_match.group(0) if summary_match else None,
+              'trxFiles': trx_files,
+              'expectedTestMethodsPresentInPinnedSource': methods_present,
               'claim': (
                   'The pinned Azure Pipelines Agent command handler accepts the exact '
                   'ServiceFabricDeploy authority-check kill-switch variable from an '
-                  'unrestricted task. Explicit settable-variable restrictions and the '
-                  'read-only enforcement knob are effective controls.'
+                  'unrestricted task. It also overwrites an existing read-only value while '
+                  'the rollout knob is false. Explicit settable-variable restrictions and '
+                  'the read-only enforcement knob are effective controls.'
               ),
               'claimLimit': (
                   'This does not prove a restricted Azure DevOps user can reach a protected '
@@ -119,7 +138,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r81-agent-variable-boundary-evidence
+          name: r81-agent-variable-boundary-evidence-v2
           path: evidence/
           if-no-files-found: error
           retention-days: 30
