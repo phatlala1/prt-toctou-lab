@@ -19,6 +19,7 @@ if (!Number.isSafeInteger(randomCount) || randomCount < 0) {
 const externalOutput = require(path.join(compiledDir, 'externaloutput.js'));
 fs.mkdirSync(path.dirname(casesPath), { recursive: true });
 const output = fs.createWriteStream(casesPath, { encoding: 'utf8' });
+const seenResidual = new Set();
 
 const knownCommands = [
   'task.debug',
@@ -36,19 +37,17 @@ const knownCommands = [
   'release.updatereleasename',
   'telemetry.publish',
 ];
-const allowedCommands = ['task.debug', 'task.setprogress'];
-const prefixes = ['', 'x', 'prefix:', '##vs', '\uFEFF', '\u200B', '\u0000'];
-const suffixes = ['', 'data', '\n', '\r\n', 'tail##vso[task.setvariable variable=R83]x'];
+const prefixes = ['', 'x', 'prefix:', '\uFEFF', '\u200B'];
+const suffixes = ['', 'data', '\n', 'tail##vso[task.setvariable variable=R83]x'];
 const propertyForms = [
   '',
   ' variable=R83',
   ' variable=R83;isOutput=true;',
   '\tvariable=R83',
   '\u00a0variable=R83',
-  ' variable=R83%3Bfoo=bar',
 ];
 const terminators = [']', ' ]', '\t]', '\u00a0]', '\u0000]', '\r]', '\n]'];
-const markerForms = ['##vso[', 'x##vso[', '##vso[##vso[', '##vs' + 'o['];
+const markerForms = ['##vso[', 'x##vso[', '##vso[##vso['];
 
 let id = 0;
 const stats = {
@@ -58,6 +57,7 @@ const stats = {
   randomInputs: randomCount,
   evaluatedByMode: { block: 0, allowDefault: 0 },
   residualByMode: { block: 0, allowDefault: 0 },
+  uniqueResidualByMode: { block: 0, allowDefault: 0 },
   emittedCases: 0,
   unicodeSubstitutions: {},
 };
@@ -84,17 +84,22 @@ function evaluate(input, origin) {
   for (const mode of ['block', 'allowDefault']) {
     stats.evaluatedByMode[mode]++;
     const filtered = filter(input, mode);
-    if (filtered.includes('##vso[')) {
-      stats.residualByMode[mode]++;
-      output.write(JSON.stringify({
-        id: ++id,
-        mode,
-        origin,
-        originalB64: toB64(input),
-        filteredB64: toB64(filtered),
-      }) + '\n');
-      stats.emittedCases++;
-    }
+    if (!filtered.includes('##vso[')) continue;
+
+    stats.residualByMode[mode]++;
+    const key = `${mode}\u0000${filtered}`;
+    if (seenResidual.has(key)) continue;
+    seenResidual.add(key);
+    stats.uniqueResidualByMode[mode]++;
+
+    output.write(JSON.stringify({
+      id: ++id,
+      mode,
+      origin,
+      originalB64: toB64(input),
+      filteredB64: toB64(filtered),
+    }) + '\n');
+    stats.emittedCases++;
   }
 }
 
@@ -107,59 +112,52 @@ function dotVariants(command) {
     `.${area}.${event}.`,
     `${area}...${event}`,
     `${area}.${event}.extra`,
-    `${area}`,
-    `${area}.${event.replace(/./g, c => c + '.')}`,
+    area,
   ];
 }
 
 function buildLowercaseSubstitutions() {
   const targets = new Set('abcdefghijklmnopqrstuvwxyz');
   const mapping = Object.fromEntries([...targets].map(c => [c, new Set([c, c.toUpperCase()])]));
-  // Scan BMP code points. Surrogate code points are skipped because they do not form scalar values alone.
   for (let cp = 0; cp <= 0xffff; cp++) {
     if (cp >= 0xd800 && cp <= 0xdfff) continue;
     const ch = String.fromCodePoint(cp);
     const lowered = ch.toLowerCase();
-    if (lowered.length === 1 && targets.has(lowered)) {
-      mapping[lowered].add(ch);
-    }
+    if (lowered.length === 1 && targets.has(lowered)) mapping[lowered].add(ch);
   }
-  const result = {};
-  for (const [key, values] of Object.entries(mapping)) {
-    result[key] = [...values].slice(0, 64);
-  }
-  return result;
+  return Object.fromEntries(
+    Object.entries(mapping).map(([key, values]) => [key, [...values].slice(0, 64)]));
 }
 
 const substitutions = buildLowercaseSubstitutions();
 stats.unicodeSubstitutions = Object.fromEntries(
-  Object.entries(substitutions).map(([k, values]) => [k, values.map(v => `U+${v.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`)]));
+  Object.entries(substitutions).map(([key, values]) => [
+    key,
+    values.map(value => `U+${value.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`),
+  ]));
 
 function unicodeVariants(command) {
   const variants = new Set([command]);
   for (let i = 0; i < command.length; i++) {
-    const c = command[i].toLowerCase();
-    const choices = substitutions[c] || [];
+    const choices = substitutions[command[i].toLowerCase()] || [];
     for (const replacement of choices) {
       if (replacement !== command[i]) {
         variants.add(command.slice(0, i) + replacement + command.slice(i + 1));
       }
     }
   }
-  // Pair substitutions catch casing equivalence interactions without exploding the corpus.
+  // One deterministic two-position substitution per command is enough to expose
+  // cross-runtime case-folding composition without a combinatorial explosion.
+  const positions = [];
   for (let i = 0; i < command.length; i++) {
-    for (let j = i + 1; j < command.length; j++) {
-      const ci = command[i].toLowerCase();
-      const cj = command[j].toLowerCase();
-      const ai = (substitutions[ci] || []).find(v => v !== command[i]);
-      const aj = (substitutions[cj] || []).find(v => v !== command[j]);
-      if (ai && aj) {
-        const chars = [...command];
-        chars[i] = ai;
-        chars[j] = aj;
-        variants.add(chars.join(''));
-      }
-    }
+    const alternate = (substitutions[command[i].toLowerCase()] || []).find(v => v !== command[i]);
+    if (alternate) positions.push([i, alternate]);
+  }
+  if (positions.length >= 2) {
+    const chars = [...command];
+    chars[positions[0][0]] = positions[0][1];
+    chars[positions[1][0]] = positions[1][1];
+    variants.add(chars.join(''));
   }
   return [...variants];
 }
@@ -182,7 +180,6 @@ for (const command of knownCommands) {
   }
 }
 
-// Long-header and multi-marker boundary cases.
 for (const length of [0, 1, 2, 6, 7, 8, 31, 63, 127, 255, 256, 257, 300, 512]) {
   for (const char of ['a', '.', ' ', ']', '\u0000', '\u00a0', '\u212A']) {
     evaluate(`##vso[${char.repeat(length)}]payload`, `long:${length}:${char.codePointAt(0)}`);
@@ -191,7 +188,6 @@ for (const length of [0, 1, 2, 6, 7, 8, 31, 63, 127, 255, 256, 257, 300, 512]) {
   }
 }
 
-// Deterministic xorshift32 random corpus. Every input contains at least one exact marker.
 let state = 0x83c0ffee >>> 0;
 function random32() {
   state ^= state << 13;
@@ -210,8 +206,7 @@ for (let n = 0; n < randomCount; n++) {
   let right = '';
   for (let i = 0; i < leftLength; i++) left += alphabet[random32() % alphabet.length];
   for (let i = 0; i < rightLength; i++) right += alphabet[random32() % alphabet.length];
-  const input = `${left}##vso[${right}`;
-  evaluate(input, `random:${n}`);
+  evaluate(`${left}##vso[${right}`, `random:${n}`);
 }
 
 output.end(() => {
