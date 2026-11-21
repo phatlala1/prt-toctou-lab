@@ -75,7 +75,9 @@ jobs:
           npm run build 2>&1 | tee ../../evidence/${{ matrix.lane }}/tasklib-build.log
           node -p "require('./package.json').version" \
             | tee ../../evidence/${{ matrix.lane }}/tasklib-version.txt
-          sha256sum task.js externaloutput.js \
+          test -f _build/task.js
+          test -f _build/externaloutput.js
+          sha256sum _build/task.js _build/externaloutput.js \
             | tee ../../evidence/${{ matrix.lane }}/tasklib-js-sha256.txt
 
       - name: Execute task-lib differential with matched controls
@@ -85,7 +87,7 @@ jobs:
         run: |
           set +e
           node lab/r82-tasklib-stateless-marker/probe.js \
-            tasklib/node \
+            tasklib/node/_build \
             evidence/${{ matrix.lane }}/tasklib-differential.json \
             2>&1 | tee evidence/${{ matrix.lane }}/tasklib-differential-console.log
           code=${PIPESTATUS[0]}
@@ -111,8 +113,8 @@ jobs:
           if not audit_path.is_file() or not probe_path.is_file():
               status = 'INVALID_RUNTIME'
               reasons.append('audit or differential result missing')
-              audit = {}
-              probe = {}
+              audit = json.loads(audit_path.read_text()) if audit_path.is_file() else {}
+              probe = json.loads(probe_path.read_text()) if probe_path.is_file() else {}
           else:
               audit = json.loads(audit_path.read_text())
               probe = json.loads(probe_path.read_text())
@@ -123,7 +125,7 @@ jobs:
                   reasons.append('task-lib differential not observed')
               elif high == 0:
                   status = 'CLOSED_NO_SHIPPING_CALLSITE'
-                  reasons.append('core API differential exists but no high-priority shipping callsite was found')
+                  reasons.append('core API differential exists but no shipping raw-output call lacked explicit line termination')
               else:
                   status = 'HOLD_MANUAL_CALLSITE_REVIEW'
                   reasons.append(f'{high} high-priority source hit(s) require manual source-to-sink validation')
