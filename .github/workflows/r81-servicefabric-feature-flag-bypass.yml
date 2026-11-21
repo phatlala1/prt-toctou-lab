@@ -58,6 +58,22 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $inputFunctions = (Resolve-Path ./tasklib/powershell/VstsTaskSdk/InputFunctions.ps1).Path
+          $featureReaderModule = New-Module -Name R81PinnedTaskLibFeatureReader -ArgumentList $inputFunctions -ScriptBlock {
+            param([string] $InputFunctionsPath)
+            function Get-LocString {
+              param([string] $Key, [object[]] $ArgumentList)
+              if ($ArgumentList) { return "$Key|$($ArgumentList -join '|')" }
+              return $Key
+            }
+            . $InputFunctionsPath
+            Export-ModuleMember -Function Get-PipelineFeature
+          }
+          Import-Module $featureReaderModule -Global -Force
+          Get-Command Get-PipelineFeature | Format-List * | Out-String |
+            Set-Content ./evidence/imported-feature-reader.txt
+
           & ./lab/r81-servicefabric-feature-flag-bypass/Invoke-R81.ps1 `
             -ProductRoot ./product `
             -TaskLibRoot ./tasklib `
