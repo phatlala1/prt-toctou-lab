@@ -12,6 +12,7 @@ if (process.argv.length !== 4) {
 const taskLibNode = path.resolve(process.argv[2]);
 const resultPath = path.resolve(process.argv[3]);
 const taskLib = require(path.join(taskLibNode, 'task.js'));
+const externalOutput = require(path.join(taskLibNode, 'externaloutput.js'));
 
 function capture(action) {
   const sink = new stream.PassThrough();
@@ -40,7 +41,7 @@ const completeSingleCall = capture(sink => {
 });
 
 const statefulWriter = capture(sink => {
-  const writer = taskLib.createFilteredWriter(options(sink), sink);
+  const writer = externalOutput.createFilteredWriter(options(sink), sink);
   writer.write('##v');
   writer.write('so[task.setvariable variable=R82_SYNTHETIC]true\n');
   writer.end();
