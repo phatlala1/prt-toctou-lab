@@ -1,0 +1,120 @@
+name: R81 ServiceFabric feature-flag boundary
+
+on:
+  push:
+    branches: [r81-servicefabric-feature-flag-bypass]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  official-task-runtime:
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out R81 laboratory
+        uses: actions/checkout@v4
+        with:
+          path: lab
+
+      - name: Check out pinned Azure Pipelines task source
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/azure-pipelines-tasks
+          ref: 8d1cc28eac0736f98c898bccfb4f3fe422c69631
+          path: product
+          sparse-checkout: |
+            Tasks/ServiceFabricDeployV1
+          sparse-checkout-cone-mode: false
+
+      - name: Check out pinned Azure Pipelines task-lib source
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/azure-pipelines-task-lib
+          ref: 43673c958dc5fb40b898c5c7b5b7b5bf0ebd14bd
+          path: tasklib
+          sparse-checkout: |
+            powershell/VstsTaskSdk/InputFunctions.ps1
+          sparse-checkout-cone-mode: false
+
+      - name: Record immutable source identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path evidence | Out-Null
+          git -C product rev-parse HEAD | Set-Content evidence/product-commit.txt
+          git -C tasklib rev-parse HEAD | Set-Content evidence/tasklib-commit.txt
+          git -C lab rev-parse HEAD | Set-Content evidence/lab-commit.txt
+          $PSVersionTable | Out-String | Set-Content evidence/powershell-version.txt
+          Get-FileHash product/Tasks/ServiceFabricDeployV1/Update-DockerSettings.psm1 -Algorithm SHA256 |
+            Format-List | Out-String | Set-Content evidence/product-module-hash.txt
+          Get-FileHash tasklib/powershell/VstsTaskSdk/InputFunctions.ps1 -Algorithm SHA256 |
+            Format-List | Out-String | Set-Content evidence/tasklib-inputfunctions-hash.txt
+
+      - name: Execute negative-first official-code matrix
+        id: runtime
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & ./lab/r81-servicefabric-feature-flag-bypass/Invoke-R81.ps1 `
+            -ProductRoot ./product `
+            -TaskLibRoot ./tasklib `
+            -EvidenceDir ./evidence `
+            2>&1 | Tee-Object -FilePath ./evidence/console.log
+          $code = $LASTEXITCODE
+          "harnessExitCode=$code" | Set-Content ./evidence/harness-exit.txt
+          exit $code
+
+      - name: Rebuild complete evidence hashes
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path evidence)) {
+            New-Item -ItemType Directory -Force -Path evidence | Out-Null
+          }
+          $lines = Get-ChildItem evidence -File -Recurse |
+            Where-Object Name -ne 'SHA256SUMS.txt' |
+            Sort-Object FullName |
+            ForEach-Object {
+              $relative = [System.IO.Path]::GetRelativePath((Resolve-Path evidence), $_.FullName).Replace('\', '/')
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $relative"
+            }
+          $lines | Set-Content evidence/SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload R81 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r81-servicefabric-feature-flag-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Surface fail-closed verdict
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path evidence/result.json)) {
+            Write-Error 'R81 result.json missing: runtime invalid.'
+            exit 2
+          }
+          $result = Get-Content evidence/result.json -Raw | ConvertFrom-Json
+          $result | ConvertTo-Json -Depth 20
+          switch ($result.Status) {
+            'OFFICIAL_TASK_RUNTIME_POSITIVE_AZDO_ACTOR_GATE_REQUIRED' {
+              Write-Error 'R81 product-code gate positive. Azure DevOps restricted-actor gate remains mandatory.'
+              exit 10
+            }
+            'RUNTIME_NEGATIVE_CLOSED' {
+              exit 0
+            }
+            default {
+              Write-Error "R81 runtime invalid: $($result.Status)"
+              exit 2
+            }
+          }
