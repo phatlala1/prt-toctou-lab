@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Owned loopback NuGet v3 server for R84.
+"""Owned loopback HTTPS NuGet v3 server for R84.
 
-The server is deliberately case-sensitive. It never contacts an external service,
-uses only synthetic credentials, and records whether NuGet sent Authorization to
-an endpoint whose path differs from the configured service-connection endpoint.
+The server is deliberately case-sensitive. It never contacts an external
+service, uses only synthetic credentials, and records whether NuGet sent
+Authorization to an endpoint whose path differs from the configured
+service-connection endpoint.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import ssl
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -54,6 +56,8 @@ class State:
             "decodedUsername": decoded_username,
             "decodedPassword": decoded_password,
             "decodeError": decode_error,
+            "tls": isinstance(handler.connection, ssl.SSLSocket),
+            "tlsVersion": handler.connection.version() if isinstance(handler.connection, ssl.SSLSocket) else None,
             "userAgent": handler.headers.get("User-Agent"),
         }
         with self.lock:
@@ -94,7 +98,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
         if parsed.path == "/__health":
-            self._send_json(200, {"ready": True})
+            self._send_json(200, {"ready": True, "tls": True})
             return
         self._handle_request(send_body=True)
 
@@ -103,8 +107,8 @@ class Handler(BaseHTTPRequestHandler):
         path = str(event["path"])
 
         # Force NuGet to ask the credential provider. The response is identical
-        # for every owned feed path; only the exact path casing identifies the
-        # tenant/feed selected by the repository-controlled NuGet.Config.
+        # for every owned feed path; only exact path casing identifies which
+        # case-sensitive tenant/feed the repository-controlled NuGet.Config chose.
         if not event["authorizationPresent"]:
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Basic realm="R84 owned feed"')
@@ -113,13 +117,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path.endswith("/v3/index.json"):
-            host = self.headers.get("Host", "127.0.0.1")
+            host = self.headers.get("Host", "r84.local")
             base_path = path[: -len("v3/index.json")]
             payload = {
                 "version": "3.0.0",
                 "resources": [
                     {
-                        "@id": f"http://{host}{base_path}flat/",
+                        "@id": f"https://{host}{base_path}flat/",
                         "@type": "PackageBaseAddress/3.0.0",
                     }
                 ],
@@ -143,11 +147,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=5084)
     parser.add_argument("--events", type=Path, required=True)
+    parser.add_argument("--cert", type=Path, required=True)
+    parser.add_argument("--key", type=Path, required=True)
     args = parser.parse_args()
 
     state = State(args.events)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.state = state  # type: ignore[attr-defined]
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(certfile=args.cert, keyfile=args.key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
     server.serve_forever(poll_interval=0.1)
 
 
