@@ -2,7 +2,8 @@ name: R84 NuGet provider path-case binding
 
 on:
   push:
-    branches: [r84-nuget-provider-path-case]
+    branches:
+      - r84-nuget-provider-path-case
   workflow_dispatch:
 
 permissions:
@@ -31,211 +32,28 @@ jobs:
             Tasks/NuGetAuthenticateV1/task.json
           sparse-checkout-cone-mode: false
 
-      - name: Install .NET runtimes used by task and restore client
+      - name: Install stable .NET 6 and .NET 10
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: |
             6.0.x
             10.0.x
 
-      - name: Record immutable product identity
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p evidence provider tls
-          cat > global.json <<'EOF'
-          {
-            "sdk": {
-              "version": "10.0.404",
-              "rollForward": "latestPatch",
-              "allowPrerelease": false
-            }
-          }
-          EOF
-          git -C lab rev-parse HEAD | tee evidence/lab-commit.txt
-          git -C product rev-parse HEAD | tee evidence/azure-pipelines-tasks-commit.txt
-          dotnet --version | tee evidence/dotnet-sdk-version.txt
-          dotnet --info | tee evidence/dotnet-info.txt
-          dotnet --list-runtimes | tee evidence/dotnet-runtimes.txt
-          sha256sum \
-            product/Tasks/NuGetAuthenticateV1/main.ts \
-            product/Tasks/NuGetAuthenticateV1/make.json \
-            product/Tasks/NuGetAuthenticateV1/task.json \
-            | tee evidence/shipping-task-source-sha256.txt
-
-      - name: Download released Microsoft Artifacts Credential Provider 1.1.0
-        shell: bash
-        run: |
-          set -euo pipefail
-          url='https://github.com/microsoft/artifacts-credprovider/releases/download/v1.1.0/Microsoft.Net6.NuGet.CredentialProvider.zip'
-          curl --fail --show-error --silent --location "$url" --output provider-1.1.0.zip
-          sha256sum provider-1.1.0.zip | tee evidence/provider-release-zip-sha256.txt
-          unzip -q provider-1.1.0.zip -d provider
-          provider_dll=$(find provider -type f -name CredentialProvider.Microsoft.dll -print -quit)
-          test -n "$provider_dll"
-          printf '%s\n' "$provider_dll" | tee evidence/provider-dll-path.txt
-          sha256sum "$provider_dll" | tee evidence/provider-dll-sha256.txt
-          mkdir -p "$HOME/.nuget/plugins/netcore"
-          cp -R "$(dirname "$provider_dll")" "$HOME/.nuget/plugins/netcore/CredentialProvider.Microsoft"
-          installed_dll="$HOME/.nuget/plugins/netcore/CredentialProvider.Microsoft/CredentialProvider.Microsoft.dll"
-          test -f "$installed_dll"
-          printf '%s\n' "$installed_dll" > evidence/installed-provider-dll-path.txt
-
-      - name: Generate and trust owned TLS certificate
-        shell: bash
-        run: |
-          set -euo pipefail
-          openssl genrsa -out tls/ca.key 2048
-          openssl req -x509 -new -sha256 -days 1 \
-            -key tls/ca.key -out tls/ca.crt \
-            -subj '/CN=R84 Owned Test CA' \
-            -addext 'basicConstraints=critical,CA:TRUE' \
-            -addext 'keyUsage=critical,keyCertSign,cRLSign'
-          openssl genrsa -out tls/server.key 2048
-          openssl req -new -sha256 \
-            -key tls/server.key -out tls/server.csr \
-            -subj '/CN=r84.local'
-          cat > tls/server.ext <<'EOF'
-          basicConstraints=critical,CA:FALSE
-          keyUsage=critical,digitalSignature,keyEncipherment
-          extendedKeyUsage=serverAuth
-          subjectAltName=DNS:r84.local,DNS:alt.r84.local
-          EOF
-          openssl x509 -req -sha256 -days 1 \
-            -in tls/server.csr -CA tls/ca.crt -CAkey tls/ca.key -CAcreateserial \
-            -out tls/server.crt -extfile tls/server.ext
-          sudo cp tls/ca.crt /usr/local/share/ca-certificates/r84-owned-ca.crt
-          sudo update-ca-certificates
-          echo '127.0.0.1 r84.local alt.r84.local' | sudo tee -a /etc/hosts
-          openssl x509 -in tls/server.crt -noout -subject -issuer -dates -ext subjectAltName \
-            | tee evidence/server-certificate.txt
-          sha256sum tls/ca.crt tls/server.crt | tee evidence/tls-certificate-sha256.txt
-
-      - name: Run released-binary and end-to-end NuGet matrix
+      - name: Execute released-provider matrix
         id: runtime
         continue-on-error: true
         shell: bash
-        env:
-          DOTNET_NOLOGO: '1'
-          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
-          DOTNET_ROLL_FORWARD: Major
-          NUGET_CREDENTIALPROVIDER_SESSIONTOKENCACHE_ENABLED: 'false'
-          NUGET_PLUGIN_PATHS: /home/runner/.nuget/plugins/netcore/CredentialProvider.Microsoft/CredentialProvider.Microsoft.dll
-          VSS_NUGET_EXTERNAL_FEED_ENDPOINTS: '{"endpointCredentials":[{"endpoint":"https://r84.local:5084/TrustedFeed/v3/index.json","username":"R84_SYNTHETIC_USER","password":"R84_SYNTHETIC_SERVICE_CONNECTION_SECRET_7F92D0"}]}'
-          NO_PROXY: r84.local,alt.r84.local,127.0.0.1,localhost
-          no_proxy: r84.local,alt.r84.local,127.0.0.1,localhost
-        run: |
-          set -euo pipefail
-          provider_dll="$HOME/.nuget/plugins/netcore/CredentialProvider.Microsoft/CredentialProvider.Microsoft.dll"
-          python3 lab/r84-nuget-provider-path-case/server.py \
-            --port 5084 \
-            --events evidence/server-events.jsonl \
-            --cert tls/server.crt \
-            --key tls/server.key \
-            > evidence/server-console.log 2>&1 &
-          server_pid=$!
-          echo "$server_pid" > evidence/server.pid
-          cleanup() {
-            kill "$server_pid" 2>/dev/null || true
-            wait "$server_pid" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-
-          ready=0
-          for attempt in $(seq 1 60); do
-            if curl --fail --silent --show-error \
-              --cacert tls/ca.crt \
-              https://r84.local:5084/__health \
-              > evidence/health.json; then
-              ready=1
-              break
-            fi
-            sleep 1
-          done
-          test "$ready" -eq 1
-
-          cli_trial() {
-            local name="$1" url="$2"
-            set +e
-            dotnet "$provider_dll" \
-              -U "$url" -N -F Json -V Debug \
-              > "evidence/cli-${name}.stdout" \
-              2> "evidence/cli-${name}.stderr"
-            local code=$?
-            set -e
-            printf '%s\n' "$code" > "evidence/cli-${name}.exit"
-          }
-
-          cli_trial exact   'https://r84.local:5084/TrustedFeed/v3/index.json'
-          cli_trial case    'https://r84.local:5084/trustedfeed/v3/index.json'
-          cli_trial sibling 'https://r84.local:5084/TrustedFeedX/v3/index.json'
-          cli_trial host    'https://alt.r84.local:5084/TrustedFeed/v3/index.json'
-
-          restore_trial() {
-            local name="$1" url="$2"
-            local dir="work/${name}"
-            mkdir -p "$dir"
-            curl --fail --silent --show-error \
-              --cacert tls/ca.crt \
-              --request POST \
-              "https://r84.local:5084/__trial?name=${name}" \
-              > "evidence/trial-${name}.json"
-
-            cat > "$dir/NuGet.Config" <<EOF
-          <?xml version="1.0" encoding="utf-8"?>
-          <configuration>
-            <packageSources>
-              <clear />
-              <add key="r84" value="$url" protocolVersion="3" />
-            </packageSources>
-          </configuration>
-          EOF
-
-            cat > "$dir/R84.csproj" <<EOF
-          <Project Sdk="Microsoft.NET.Sdk">
-            <PropertyGroup>
-              <TargetFramework>net10.0</TargetFramework>
-              <RestoreDisableParallel>true</RestoreDisableParallel>
-            </PropertyGroup>
-            <ItemGroup>
-              <PackageReference Include="R84.Synthetic.${name}" Version="1.0.0" />
-            </ItemGroup>
-          </Project>
-          EOF
-
-            set +e
-            dotnet restore "$dir/R84.csproj" \
-              --configfile "$dir/NuGet.Config" \
-              --no-cache --force-evaluate --disable-parallel \
-              --verbosity diagnostic \
-              > "evidence/restore-${name}.stdout" \
-              2> "evidence/restore-${name}.stderr"
-            local code=$?
-            set -e
-            printf '%s\n' "$code" > "evidence/restore-${name}.exit"
-          }
-
-          restore_trial exact   'https://r84.local:5084/TrustedFeed/v3/index.json'
-          restore_trial case    'https://r84.local:5084/trustedfeed/v3/index.json'
-          restore_trial sibling 'https://r84.local:5084/TrustedFeedX/v3/index.json'
-          restore_trial host    'https://alt.r84.local:5084/TrustedFeed/v3/index.json'
-
-          set +e
-          python3 lab/r84-nuget-provider-path-case/verify.py evidence \
-            2>&1 | tee evidence/verifier-console.log
-          code=${PIPESTATUS[0]}
-          set -e
-          printf '%s\n' "$code" > evidence/verifier-exit.txt
-          exit "$code"
+        run: bash ./lab/r84-nuget-provider-path-case/run.sh
 
       - name: Rebuild complete evidence hashes
         if: always()
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p evidence
           find evidence -type f ! -name SHA256SUMS.txt -print0 \
             | sort -z \
-            | xargs -0 sha256sum \
+            | xargs -0 -r sha256sum \
             | sed 's#  evidence/#  #' \
             > evidence/SHA256SUMS.txt
 
