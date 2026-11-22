@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hmac
 import json
 import ssl
 import threading
@@ -18,6 +19,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+
+EXPECTED_USERNAME = "R84_SYNTHETIC_USER"
+EXPECTED_PASSWORD = "R84_SYNTHETIC_SERVICE_CONNECTION_SECRET_7F92D0"
 
 
 class State:
@@ -44,6 +48,13 @@ class State:
             except Exception as exc:  # evidence only
                 decode_error = f"{type(exc).__name__}: {exc}"
 
+        valid_synthetic_credential = bool(
+            decoded_username is not None
+            and decoded_password is not None
+            and hmac.compare_digest(decoded_username, EXPECTED_USERNAME)
+            and hmac.compare_digest(decoded_password, EXPECTED_PASSWORD)
+        )
+
         event = {
             "kind": "request",
             "trial": self.trial,
@@ -55,6 +66,7 @@ class State:
             "authorizationScheme": authorization.split(" ", 1)[0] if authorization else None,
             "decodedUsername": decoded_username,
             "decodedPassword": decoded_password,
+            "validSyntheticCredential": valid_synthetic_credential,
             "decodeError": decode_error,
             "tls": isinstance(handler.connection, ssl.SSLSocket),
             "tlsVersion": handler.connection.version() if isinstance(handler.connection, ssl.SSLSocket) else None,
@@ -106,10 +118,10 @@ class Handler(BaseHTTPRequestHandler):
         event = self.state.record(self)
         path = str(event["path"])
 
-        # Force NuGet to ask the credential provider. The response is identical
-        # for every owned feed path; only exact path casing identifies which
-        # case-sensitive tenant/feed the repository-controlled NuGet.Config chose.
-        if not event["authorizationPresent"]:
+        # NuGet may first probe with no Authorization or an empty Basic header.
+        # Reject every credential except the synthetic service-connection pair so
+        # the end-to-end control proves that the credential provider was invoked.
+        if not event["validSyntheticCredential"]:
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Basic realm="R84 owned feed"')
             self.send_header("Content-Length", "0")
