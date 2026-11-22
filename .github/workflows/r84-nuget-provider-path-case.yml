@@ -43,8 +43,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p evidence provider tls
+          cat > global.json <<'EOF'
+          {
+            "sdk": {
+              "version": "10.0.404",
+              "rollForward": "latestPatch",
+              "allowPrerelease": false
+            }
+          }
+          EOF
           git -C lab rev-parse HEAD | tee evidence/lab-commit.txt
           git -C product rev-parse HEAD | tee evidence/azure-pipelines-tasks-commit.txt
+          dotnet --version | tee evidence/dotnet-sdk-version.txt
           dotnet --info | tee evidence/dotnet-info.txt
           dotnet --list-runtimes | tee evidence/dotnet-runtimes.txt
           sha256sum \
@@ -61,10 +71,11 @@ jobs:
           curl --fail --show-error --silent --location "$url" --output provider-1.1.0.zip
           sha256sum provider-1.1.0.zip | tee evidence/provider-release-zip-sha256.txt
           unzip -q provider-1.1.0.zip -d provider
-          provider_dll=$(find provider -type f -name CredentialProvider.Microsoft.dll | head -1)
+          provider_dll=$(find provider -type f -name CredentialProvider.Microsoft.dll -print -quit)
           test -n "$provider_dll"
           printf '%s\n' "$provider_dll" | tee evidence/provider-dll-path.txt
           sha256sum "$provider_dll" | tee evidence/provider-dll-sha256.txt
+          mkdir -p "$HOME/.nuget/plugins/netcore"
           cp -R "$(dirname "$provider_dll")" "$HOME/.nuget/plugins/netcore/CredentialProvider.Microsoft"
           installed_dll="$HOME/.nuget/plugins/netcore/CredentialProvider.Microsoft/CredentialProvider.Microsoft.dll"
           test -f "$installed_dll"
@@ -77,14 +88,16 @@ jobs:
           openssl genrsa -out tls/ca.key 2048
           openssl req -x509 -new -sha256 -days 1 \
             -key tls/ca.key -out tls/ca.crt \
-            -subj '/CN=R84 Owned Test CA'
+            -subj '/CN=R84 Owned Test CA' \
+            -addext 'basicConstraints=critical,CA:TRUE' \
+            -addext 'keyUsage=critical,keyCertSign,cRLSign'
           openssl genrsa -out tls/server.key 2048
           openssl req -new -sha256 \
             -key tls/server.key -out tls/server.csr \
             -subj '/CN=r84.local'
           cat > tls/server.ext <<'EOF'
-          basicConstraints=CA:FALSE
-          keyUsage=digitalSignature,keyEncipherment
+          basicConstraints=critical,CA:FALSE
+          keyUsage=critical,digitalSignature,keyEncipherment
           extendedKeyUsage=serverAuth
           subjectAltName=DNS:r84.local,DNS:alt.r84.local
           EOF
@@ -109,6 +122,8 @@ jobs:
           NUGET_CREDENTIALPROVIDER_SESSIONTOKENCACHE_ENABLED: 'false'
           NUGET_PLUGIN_PATHS: /home/runner/.nuget/plugins/netcore/CredentialProvider.Microsoft/CredentialProvider.Microsoft.dll
           VSS_NUGET_EXTERNAL_FEED_ENDPOINTS: '{"endpointCredentials":[{"endpoint":"https://r84.local:5084/TrustedFeed/v3/index.json","username":"R84_SYNTHETIC_USER","password":"R84_SYNTHETIC_SERVICE_CONNECTION_SECRET_7F92D0"}]}'
+          NO_PROXY: r84.local,alt.r84.local,127.0.0.1,localhost
+          no_proxy: r84.local,alt.r84.local,127.0.0.1,localhost
         run: |
           set -euo pipefail
           provider_dll="$HOME/.nuget/plugins/netcore/CredentialProvider.Microsoft/CredentialProvider.Microsoft.dll"
